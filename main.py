@@ -16,9 +16,9 @@ from singleVis.sampler import WeightedRandomSampler
 
 # Parameters
 # content_path = "/home/zicong/data/Code_Retrieval_Samples/merged_train_data/"
-content_path = "/home/zicong/data/multi_epochs_cls/"
+content_path = "/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/training_dynamic/temporal_ranking/Model"
 epoch_start = 1
-epoch_end = 6
+epoch_end = 20
 epoch_period = 1
 split = 0
 input_dims = 768  # Adjust according to your data
@@ -42,8 +42,9 @@ T_N_EPOCHS = 100
 VARIANTS = "SVis"
 TEMP_TYPE = "local"
 SCHEDULE = None
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda:0")
 max_samples = 1000
+VIS_MODEL_NAME = "tsvis"
 # selected_groups = [2]
 
 # Data Provider
@@ -129,6 +130,12 @@ trainer = SingleVisTrainer(
 
 # Train the model
 trainer.train(PATIENT=PATIENT, max_epochs=MAX_EPOCH)
+
+# save result
+save_dir = content_path
+ ##### save the visulization model
+trainer.save(save_dir=save_dir, file_name="{}".format(VIS_MODEL_NAME))
+
 
 """
 # Visualization
