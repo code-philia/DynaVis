@@ -73,39 +73,47 @@ class SingleVisTrainer:
         all_loss = []
         umap_losses = []
         recon_losses = []
-        rank_losses = []
+        temporal_losses = []
 
-        t = tqdm(self.edge_loader, leave=True, total=len(self.edge_loader), desc=f"Epoch {self.epoch + 1}")
-        #flag = 0
-
+        t = tqdm(self.edge_loader, leave=True, total=len(self.edge_loader))
         for data in t:
-            edge_to, edge_from = data
+            edge_to, edge_from, is_temporal = data
+            
+            # 将数据移到设备上
             edge_to = edge_to.to(device=self.DEVICE, dtype=torch.float32)
             edge_from = edge_from.to(device=self.DEVICE, dtype=torch.float32)
-
+            is_temporal = is_temporal.to(device=self.DEVICE)
+            
+            # 前向传播
             outputs = self.model(edge_to, edge_from)
-            #print("Model outputs:", outputs["umap"], outputs["recon"])
-            umap_l, recon_l, rank_l, loss= self.criterion(edge_to, edge_from, outputs)
+            
+            # 计算损失
+            umap_l, recon_l, temporal_l, loss = self.criterion(
+                edge_to, 
+                edge_from, 
+                outputs,
+                is_temporal
+            )
+    
+            # 记录损失
             all_loss.append(loss.item())
             umap_losses.append(umap_l.item())
             recon_losses.append(recon_l.item())
-            rank_losses.append(rank_l.item())
-            #print(umap_l.item(), recon_l.item(), loss.item())
-            #flag+=1
-            #assert flag<=2
-
+            temporal_losses.append(temporal_l.item())
+            
+            # 反向传播
             self.optimizer.zero_grad()
             loss.backward()
-            # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)  # Add gradient clipping
             self.optimizer.step()
 
-        self._loss = sum(all_loss) / len(all_loss)
+        # 更新学习率
         self.lr_scheduler.step()
-
-        self.epoch_loss = self._loss
+        
+        # 记录epoch损失
+        self.epoch_loss = sum(all_loss) / len(all_loss)
         self.epoch_umap_loss = sum(umap_losses) / len(umap_losses)
         self.epoch_recon_loss = sum(recon_losses) / len(recon_losses)
-        self.epoch_rank_loss = sum(rank_losses) / len(rank_losses)
+        self.epoch_temporal_loss = sum(temporal_losses) / len(temporal_losses)
 
     def train(self, PATIENT, max_epochs):
         patient = PATIENT
@@ -117,9 +125,9 @@ class SingleVisTrainer:
             prev_loss = self._loss
             self.train_step()
 
-            print(f"UMAP Loss: {self.epoch_umap_loss:.4f}, Recon Loss: {self.epoch_recon_loss:.4f}, rank Loss: {self.epoch_rank_loss:.4f}, Total Loss: {self.epoch_loss:.4f}")
+            print(f"UMAP Loss: {self.epoch_umap_loss:.4f}, Recon Loss: {self.epoch_recon_loss:.4f}, Temporal Loss: {self.epoch_temporal_loss:.4f}, Total Loss: {self.epoch_loss:.4f}")
 
-            if prev_loss - self._loss < 1E-3:
+            if prev_loss - self._loss < 1E-4:
                 if patient == 0:
                     break
                 else:

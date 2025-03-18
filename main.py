@@ -12,13 +12,14 @@ from singleVis.visualization_model import SingleVisualizationModel
 from singleVis.trainer import SingleVisTrainer
 from singleVis.backend import find_ab_params
 from singleVis.visualizer import DataVisualizer
-from singleVis.sampler import WeightedRandomSampler
+from singleVis.sampler import WeightedRandomSampler, TemporalPreservingSampler
+from singleVis.losses import UmapLoss, ReconLoss, SingleVisLoss, TemporalRankingLoss
 
 # Parameters
 # content_path = "/home/zicong/data/Code_Retrieval_Samples/merged_train_data/"
 content_path = "/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/training_dynamic/temporal_ranking/Model"
 epoch_start = 1
-epoch_end = 20
+epoch_end = 50
 epoch_period = 1
 split = 0
 input_dims = 768  # Adjust according to your data
@@ -81,6 +82,10 @@ edge_to = edge_to[eliminate_zeros]
 edge_from = edge_from[eliminate_zeros]
 probs = probs[eliminate_zeros]
 
+# Create temporal edge identifier array
+is_temporal = np.zeros(len(edge_to), dtype=bool)
+is_temporal[len(s_edge_to):] = True  # Mark temporal edges
+
 # Define the model
 model = SingleVisualizationModel(
     input_dims=input_dims,
@@ -92,7 +97,6 @@ model = SingleVisualizationModel(
 model = model.to(DEVICE)
 
 # Define loss
-from singleVis.losses import UmapLoss, ReconLoss, SingleVisLoss
 a, b = find_ab_params(1.0, 0.1)
 umap_loss = UmapLoss(
     negative_sample_rate=5,
@@ -102,7 +106,17 @@ umap_loss = UmapLoss(
     repulsion_strength=1.0
 )
 recon_loss = ReconLoss(beta=1.0)
-criterion = SingleVisLoss(umap_loss, recon_loss, lambd=1.0)
+temporal_loss = TemporalRankingLoss(
+    data_provider=data_provider,
+    temporal_edges=(feature_vectors[t_edge_from], feature_vectors[t_edge_to])
+)
+criterion = SingleVisLoss(
+    umap_loss=umap_loss,
+    recon_loss=recon_loss,
+    temporal_loss=temporal_loss,
+    lambd=1.0,
+    gamma=3.0  # Control temporal ranking loss weight
+)
 
 # Define optimizer and lr_scheduler
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-5)
@@ -113,11 +127,28 @@ lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=4, gamma=.1)
 
 # Define DataLoader
 from singleVis.data_handler import DataHandler
-dataset = DataHandler(edge_to, edge_from, feature_vectors)
+dataset = DataHandler(edge_to, edge_from, feature_vectors, is_temporal=is_temporal)
 # n_samples = edge_to.shape[0]
 n_samples = int(np.sum(S_N_EPOCHS * probs) // 1)
-sampler = WeightedRandomSampler(probs, n_samples, replacement=True)
-edge_loader = DataLoader(dataset, batch_size=1000, sampler=sampler)
+
+# 计算要采样的空间边数量
+num_spatial_samples = int(np.sum(S_N_EPOCHS * probs[~is_temporal]) // 1)
+
+# 创建采样器
+sampler = TemporalPreservingSampler(
+    weights=probs,
+    num_spatial_samples=num_spatial_samples,
+    is_temporal=is_temporal,
+    edge_from=edge_from  # 添加edge_from参数
+)
+
+# 创建DataLoader
+edge_loader = DataLoader(
+    dataset, 
+    batch_size=2000,
+    sampler=sampler,
+    drop_last=False
+)
 
 # Trainer
 trainer = SingleVisTrainer(
@@ -342,7 +373,7 @@ def show_sample_ranking_preservation(data, embedding, n_neighbors=15, n_samples=
         
         print("高维空间中的前5个邻居:")
         print(f"{'邻居ID':<10}{'高维排名':<10}{'低维排名':<10}{'排名变化':<10}")
-        for j, neighbor_id in enumerate(high_neighbors[:5]):
+        for j, neighbor_id in enumerate(high_neighbors[:15]):
             # 查找该邻居在低维空间中的排名
             low_rank = np.where(low_neighbors == neighbor_id)[0]
             if len(low_rank) > 0:
@@ -353,7 +384,7 @@ def show_sample_ranking_preservation(data, embedding, n_neighbors=15, n_samples=
         
         print("\n低维空间中的前5个邻居:")
         print(f"{'邻居ID':<10}{'低维排名':<10}{'高维排名':<10}{'排名变化':<10}")
-        for j, neighbor_id in enumerate(low_neighbors[:5]):
+        for j, neighbor_id in enumerate(low_neighbors[:15]):
             high_rank = np.where(high_neighbors == neighbor_id)[0]
             if len(high_rank) > 0:
                 high_rank = high_rank[0]

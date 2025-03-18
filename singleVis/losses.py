@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from .backend import convert_distance_to_probability, compute_cross_entropy
 import numpy as np
+from tqdm import tqdm
 
 """
 class UmapLoss(torch.nn.Module):
@@ -103,24 +104,115 @@ class ReconLoss(torch.nn.Module):
         loss2 = torch.mean(torch.mean(torch.pow(edge_from - recon_from, 2), 1))
         return (loss1 + loss2) / 2
 
-class SingleVisLoss(torch.nn.Module):
-    def __init__(self, umap_loss, recon_loss, lambd):
+class TemporalRankingLoss(nn.Module):
+    def __init__(self, data_provider, temporal_edges):
+        """
+        :param data_provider: 数据提供者
+        :param temporal_edges: (t_edge_from, t_edge_to) 所有时序边
+        """
+        super(TemporalRankingLoss, self).__init__()
+        self.t_edge_from, self.t_edge_to = temporal_edges
+        
+    def forward(self, edge_to, edge_from, embedding_to, embedding_from, is_temporal):
+        """
+        :param edge_to: 当前batch中的目标节点特征
+        :param edge_from: 当前batch中的源节点特征
+        :param embedding_to: 目标节点的低维嵌入
+        :param embedding_from: 源节点的低维嵌入
+        :param is_temporal: 是否为时序边的标记
+        """
+        if not torch.any(is_temporal):
+            return torch.tensor(0.0, device=edge_from.device, requires_grad=True)
+        
+        # 只保留时序边
+        temporal_mask = is_temporal.bool()
+        edge_to = edge_to[temporal_mask]
+        edge_from = edge_from[temporal_mask]
+        embedding_to = embedding_to[temporal_mask]
+        embedding_from = embedding_from[temporal_mask]
+        
+        loss = torch.tensor(0.0, device=edge_from.device, requires_grad=True)
+        valid_pairs = 0
+        
+        # 对当前batch中的每个from节点
+        unique_from = torch.unique(edge_from, dim=0)
+        # print(len(unique_from))
+        for from_feat in unique_from:
+            # 找到当前batch中这个from对应的所有to
+            mask = torch.all(edge_from == from_feat, dim=1)
+            curr_to_feats = edge_to[mask]
+            curr_to_embeds = embedding_to[mask]
+            curr_from_embed = embedding_from[mask][0]
+            # print(len(curr_to_feats))
+            
+            # if len(curr_to_feats) < 2:
+            #     continue
+                
+            # 计算高维空间中的距离
+            D_high = torch.norm(curr_to_feats - from_feat.unsqueeze(0), dim=1)
+            
+            # 计算低维空间中的距离
+            D_low = torch.norm(curr_to_embeds - curr_from_embed, dim=1)
+            
+            # 对所有可能的邻居对计算ranking loss
+            n = len(curr_to_feats)
+            for i in range(n):
+                for k in range(n):
+                    if i != k:
+                        # 如果在高维空间中xi到xj的距离小于xi到xk的距离
+                        if D_high[i] < D_high[k]:
+                            # 那么在低维空间中也应该保持这种关系
+                            # 如果不满足，就产生loss
+                            if D_low[i] >= D_low[k]:
+                                loss = loss + (D_low[i] - D_low[k])
+                                valid_pairs += 1
+        
+        if valid_pairs == 0:
+            return torch.tensor(0.0, device=edge_from.device, requires_grad=True)
+        
+        return loss / valid_pairs
+
+
+class SingleVisLoss(nn.Module):
+    def __init__(self, umap_loss, recon_loss, temporal_loss=None, lambd=1.0, gamma=1.0):
         super(SingleVisLoss, self).__init__()
         self.umap_loss = umap_loss
         self.recon_loss = recon_loss
+        self.temporal_loss = temporal_loss
         self.lambd = lambd
+        self.gamma = gamma
 
-    def forward(self, edge_to, edge_from, outputs):
+    def forward(self, edge_to, edge_from, outputs, is_temporal):
+        """
+        :param edge_to: 高维特征
+        :param edge_from: 高维特征
+        :param outputs: 模型输出的字典，包含umap和重构结果
+        :param is_temporal: 布尔张量，标识哪些边是时序边
+        """
         embedding_to, embedding_from = outputs["umap"]
-        umap_l = self.umap_loss(embedding_to, embedding_from)
         recon_to, recon_from = outputs["recon"]
-        recon_l = self.recon_loss(edge_to, edge_from, recon_to, recon_from)
-        # 计算 Ranking Loss
-        rank_l = batch_ranking_loss(edge_from, edge_to, embedding_from, embedding_to)
         
-        total_loss = umap_l + self.lambd * recon_l + rank_l
-        return umap_l, recon_l, rank_l, total_loss
-    
+        # UMAP loss
+        umap_loss = self.umap_loss(embedding_to, embedding_from)
+        
+        # Reconstruction loss
+        recon_loss = self.recon_loss(edge_to, edge_from, recon_to, recon_from)
+        
+        # Temporal ranking loss
+        temporal_loss = 0.0
+        if self.temporal_loss is not None:
+            temporal_loss = self.temporal_loss(
+                edge_to, 
+                edge_from, 
+                embedding_to, 
+                embedding_from,
+                is_temporal
+            )
+        
+        total_loss = umap_loss + self.lambd * recon_loss + self.gamma * temporal_loss
+        
+        return umap_loss, recon_loss, temporal_loss, total_loss
+
 import torch.nn.functional as F
 
 def batch_ranking_loss(edge_from, edge_to, embedding_from, embedding_to):
