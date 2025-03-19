@@ -4,45 +4,56 @@ import numpy as np
 import re
 
 class DataProvider:
-    def __init__(self, content_path, epoch_start, epoch_end, epoch_period, split, selected_groups=None):
+    def __init__(self, content_path, epoch_start, epoch_end, epoch_period, select_idxs=None):
         self.content_path = content_path
         self.s = epoch_start
         self.e = epoch_end
         self.p = epoch_period
-        self.split = split
-        self.selected_groups = selected_groups or []
+        self.select_idxs = select_idxs
         self.train_epochs = self._list_train_epochs()
 
     def _list_train_epochs(self):
-        train_files = os.listdir(self.content_path)
-        epochs = dict()
-        pattern = re.compile(r"Epoch_(\d+)_train_data_(\d+).npy")
-        for file in train_files:
-            match = pattern.match(file)
-            if match:
-                epoch = int(match.group(1))
-                group = int(match.group(2))
-                if group not in self.selected_groups:
-                    continue
-                if epoch not in epochs:
-                    epochs[epoch] = []
-                epochs[epoch].append(os.path.join(self.content_path, file))
-        return epochs
+        train_epochs = {}
+        for dir_name in os.listdir(self.content_path):
+            dir_path = os.path.join(self.content_path, dir_name)
+            if os.path.isdir(dir_path):
+                match = re.match(r"Epoch_(\d+)", dir_name)
+                if match:
+                    epoch = int(match.group(1))
+                    if self.s <= epoch <= self.e and (epoch - self.s) % self.p == 0:
+                        data_file = os.path.join(dir_path, "train_data.npy")
+                        if os.path.isfile(data_file):
+                            train_epochs[epoch] = data_file
+        return train_epochs
 
-    def train_representation(self, epoch):
+    def train_representation(self, epoch, select_sample=None):
         try:
-            self.train_epochs = self._list_train_epochs()
-            train_files = self.train_epochs.get(epoch, [])
-            if not train_files:
+            if select_sample is not None:
+                select_idxs = select_sample
+            else:
+                select_idxs = self.select_idxs
+
+            dir_name = f"Epoch_{epoch}"
+            dir_path = os.path.join(self.content_path, dir_name)
+            data_path = os.path.join(dir_path, "train_data.npy")
+
+            if not os.path.isfile(data_path):
+                print(f"Epoch {epoch} not found in train_epochs.")
                 return None
-            train_data = []
-            for file in train_files:
-                data = np.load(file)
-                train_data.append(data)
-            return np.vstack(train_data)
-        except:
+
+            data = np.load(data_path)
+
+            if select_idxs is not None:
+                data = data[select_idxs]
+
+            return data
+        except Exception as e:
+            print(f"Error loading data for Epoch {epoch}: {e}")
             return None
 
+    def get_available_epochs(self):
+        return sorted(list(self.train_epochs.keys()))
+    
 import os
 import numpy as np
 import re

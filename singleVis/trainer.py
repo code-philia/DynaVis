@@ -127,7 +127,7 @@ class SingleVisTrainer:
 
             print(f"UMAP Loss: {self.epoch_umap_loss:.4f}, Recon Loss: {self.epoch_recon_loss:.4f}, Temporal Loss: {self.epoch_temporal_loss:.4f}, Total Loss: {self._loss:.4f}")
 
-            if prev_loss - self._loss < 1E-4:
+            if prev_loss - self._loss < 1E-2:
                 if patient == 0:
                     break
                 else:

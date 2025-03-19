@@ -105,10 +105,10 @@ class TemporalPreservingSampler(Sampler[int]):
 
         # 打印unique edge_from和对应的edge_to数量
         unique_from = torch.unique(self.edge_from[temporal_indices])
-        print(f"Found {len(unique_from)} unique edge_from.")
-        for from_idx in unique_from:
-            count_to = (self.edge_from[temporal_indices] == from_idx).sum().item()
-            print(f"Edge from {from_idx.item()} has {count_to} edge_to.")
+        # print(f"Found {len(unique_from)} unique edge_from.")
+        # for from_idx in unique_from:
+        #     count_to = (self.edge_from[temporal_indices] == from_idx).sum().item()
+        #     print(f"Edge from {from_idx.item()} has {count_to} edge_to.")
 
         # 将采样的空间边索引和分组后的时序边索引连接
         all_indices = torch.cat([

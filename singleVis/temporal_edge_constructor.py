@@ -54,32 +54,33 @@ class TemporalEdgeConstructor:
         indices = - np.ones((num, self.n_neighbors), dtype=int)
         dists = np.zeros((num, self.n_neighbors), dtype=np.float32)
 
-        for time_step in range(self.time_steps):
-            start_idx = base_idx_list[time_step]
-            end_idx = start_idx + self.time_step_nums[time_step][0] - 1
+        # Construct temporal lists for each point
+        for i in range(num):
+            temporal_list = []
+            for time_step in range(self.time_steps):
+                start_idx = base_idx_list[time_step]
+                end_idx = start_idx + self.time_step_nums[time_step][0] - 1
+                # Calculate the position of the point in the current time step
+                position_in_time_step = i % self.time_step_nums[time_step][0]
+                # Find the corresponding point in the current time step
+                corresponding_point = start_idx + position_in_time_step
+                if start_idx <= corresponding_point <= end_idx:
+                    temporal_list.append(corresponding_point)
+            
+            temporal_list = np.array(temporal_list)
+            temporal_list = temporal_list[temporal_list != i]  # Exclude the point itself
 
-            for i in range(start_idx, end_idx + 1):
-                if time_step < self.time_steps - 1:
-                    next_start = base_idx_list[time_step + 1]
-                    next_end = next_start + self.time_step_nums[time_step + 1][0] - 1
-                    candidate_idxs = np.arange(start_idx, end_idx + 1)
-                    candidate_idxs = np.concatenate((candidate_idxs, np.arange(next_start, next_end + 1)))
-                else:
-                    candidate_idxs = np.arange(start_idx, end_idx + 1)
-                
-                candidate_idxs = candidate_idxs[candidate_idxs != i]
-                nn_dist = np.linalg.norm(self.features[i] - self.features[candidate_idxs], axis=1)
-                if len(candidate_idxs) > self.n_neighbors:
-                    sorted_indices = np.argsort(nn_dist)[:self.n_neighbors]
-                    candidate_idxs = candidate_idxs[sorted_indices]
-                    nn_dist = nn_dist[sorted_indices]
-                else:
-                    sorted_indices = np.argsort(nn_dist)
-                    candidate_idxs = candidate_idxs[sorted_indices]
-                    nn_dist = nn_dist[sorted_indices]
-                
-                indices[i] = candidate_idxs
-                dists[i] = nn_dist
+            # Calculate distances to all points in the temporal list
+            nn_dist = np.linalg.norm(self.features[i] - self.features[temporal_list], axis=1)
+
+            # Find the n_neighbors closest points
+            if len(temporal_list) > self.n_neighbors:
+                sorted_indices = np.argsort(nn_dist)[:self.n_neighbors]
+            else:
+                sorted_indices = np.argsort(nn_dist)
+
+            indices[i] = temporal_list[sorted_indices]
+            dists[i] = nn_dist[sorted_indices]
 
         # Ensure sigmas and rhos are float32
         sigmas = np.ones(num, dtype=np.float32)
