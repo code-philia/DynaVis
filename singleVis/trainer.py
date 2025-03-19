@@ -110,7 +110,7 @@ class SingleVisTrainer:
         self.lr_scheduler.step()
         
         # 记录epoch损失
-        self.epoch_loss = sum(all_loss) / len(all_loss)
+        self._loss = sum(all_loss) / len(all_loss)
         self.epoch_umap_loss = sum(umap_losses) / len(umap_losses)
         self.epoch_recon_loss = sum(recon_losses) / len(recon_losses)
         self.epoch_temporal_loss = sum(temporal_losses) / len(temporal_losses)
@@ -125,7 +125,7 @@ class SingleVisTrainer:
             prev_loss = self._loss
             self.train_step()
 
-            print(f"UMAP Loss: {self.epoch_umap_loss:.4f}, Recon Loss: {self.epoch_recon_loss:.4f}, Temporal Loss: {self.epoch_temporal_loss:.4f}, Total Loss: {self.epoch_loss:.4f}")
+            print(f"UMAP Loss: {self.epoch_umap_loss:.4f}, Recon Loss: {self.epoch_recon_loss:.4f}, Temporal Loss: {self.epoch_temporal_loss:.4f}, Total Loss: {self._loss:.4f}")
 
             if prev_loss - self._loss < 1E-4:
                 if patient == 0:

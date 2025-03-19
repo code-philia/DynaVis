@@ -170,7 +170,8 @@ sampler = TemporalPreservingSampler(
     weights=probs,
     num_spatial_samples=num_spatial_samples,
     is_temporal=is_temporal,
-    edge_from=edge_from  # 添加edge_from参数
+    edge_from=edge_from,
+    edge_to=edge_to
 )
 
 edge_loader = DataLoader(

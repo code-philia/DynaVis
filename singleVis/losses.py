@@ -112,7 +112,50 @@ class TemporalRankingLoss(nn.Module):
         """
         super(TemporalRankingLoss, self).__init__()
         self.t_edge_from, self.t_edge_to = temporal_edges
+        self.neighbor_ranks = self._precompute_neighbor_ranks()
         
+    def _precompute_neighbor_ranks(self):
+        """
+        Precompute the distance rank between each point and its neighbors.
+        :return: Dict[int, Dict[int, int]] 
+                {from_idx: {to_idx: rank}}
+        """
+        neighbor_ranks = {}
+        
+        # Convert numpy arrays to tensors if necessary
+        if isinstance(self.t_edge_from, np.ndarray):
+            self.t_edge_from = torch.tensor(self.t_edge_from)
+        if isinstance(self.t_edge_to, np.ndarray):
+            self.t_edge_to = torch.tensor(self.t_edge_to)
+        
+        # For each unique 'from' feature
+        unique_from = torch.unique(self.t_edge_from, dim=0)
+        
+        for from_feat in tqdm(unique_from, desc="Computing neighbor ranks"):
+            from_key = tuple(from_feat.tolist())  # Convert tensor to a tuple for use as a dictionary key
+            neighbor_ranks[from_key] = {}
+            
+            # Find all 'to' features corresponding to the current 'from'
+            mask = (self.t_edge_from == from_feat).all(dim=1)
+            curr_to_feats = self.t_edge_to[mask]
+            
+            # Print the number of neighbors for the current 'from'
+            num_neighbors = curr_to_feats.size(0)
+            print(f"Edge from {from_key} has {num_neighbors} neighbors.")
+            
+            # Compute distances to all neighbors
+            D = torch.norm(curr_to_feats - from_feat.unsqueeze(0), dim=1)
+            
+            # Get sorted indices
+            sorted_indices = torch.argsort(D)
+            
+            # Store the rank of each neighbor
+            for rank, idx in enumerate(sorted_indices):
+                to_key = tuple(curr_to_feats[idx].tolist())  # Convert tensor to a tuple for use as a dictionary key
+                neighbor_ranks[from_key][to_key] = rank
+        
+        return neighbor_ranks
+    
     def forward(self, edge_to, edge_from, embedding_to, embedding_from, is_temporal):
         """
         :param edge_to: 当前batch中的目标节点特征
@@ -136,20 +179,19 @@ class TemporalRankingLoss(nn.Module):
         
         # 对当前batch中的每个from节点
         unique_from = torch.unique(edge_from, dim=0)
-        # print(len(unique_from))
         for from_feat in unique_from:
+            from_key = from_feat.item()
+            if from_key not in self.neighbor_ranks:
+                continue
+            
+            # 获取预计算的排名信息
+            precomputed_ranks = self.neighbor_ranks[from_key]
+            
             # 找到当前batch中这个from对应的所有to
             mask = torch.all(edge_from == from_feat, dim=1)
             curr_to_feats = edge_to[mask]
             curr_to_embeds = embedding_to[mask]
             curr_from_embed = embedding_from[mask][0]
-            # print(len(curr_to_feats))
-            
-            # if len(curr_to_feats) < 2:
-            #     continue
-                
-            # 计算高维空间中的距离
-            D_high = torch.norm(curr_to_feats - from_feat.unsqueeze(0), dim=1)
             
             # 计算低维空间中的距离
             D_low = torch.norm(curr_to_embeds - curr_from_embed, dim=1)
@@ -159,13 +201,23 @@ class TemporalRankingLoss(nn.Module):
             for i in range(n):
                 for k in range(n):
                     if i != k:
-                        # 如果在高维空间中xi到xj的距离小于xi到xk的距离
-                        if D_high[i] < D_high[k]:
-                            # 那么在低维空间中也应该保持这种关系
-                            # 如果不满足，就产生loss
-                            if D_low[i] >= D_low[k]:
-                                loss = loss + (D_low[i] - D_low[k])
-                                valid_pairs += 1
+                        to_key_i = curr_to_feats[i].item()
+                        to_key_k = curr_to_feats[k].item()
+                        
+                        if to_key_i in precomputed_ranks and to_key_k in precomputed_ranks:
+                            high_rank_i = precomputed_ranks[to_key_i]
+                            high_rank_k = precomputed_ranks[to_key_k]
+                            
+                            # 如果在高维空间中xi到xj的距离小于xi到xk的距离
+                            if high_rank_i < high_rank_k:
+                                # 计算排名差距
+                                rank_diff = abs(high_rank_i - high_rank_k)
+                                # 那么在低维空间中也应该保持这种关系
+                                # 如果不满足，就产生loss
+                                if D_low[i] >= D_low[k]:
+                                    # 乘以排名差距的系数
+                                    loss = loss + (D_low[i] - D_low[k]) * rank_diff
+                                    valid_pairs += 1
         
         if valid_pairs == 0:
             return torch.tensor(0.0, device=edge_from.device, requires_grad=True)
