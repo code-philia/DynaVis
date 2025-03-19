@@ -12,7 +12,7 @@ from singleVis.visualization_model import SingleVisualizationModel
 from singleVis.incr_trainer import IncrementalVisTrainer
 from singleVis.backend import find_ab_params
 from singleVis.visualizer import IncrDataVisualizer
-from singleVis.losses import SingleVisLoss, UmapLoss, ReconLoss
+from Project.TimeVisPlus.singleVis.losses_rank import SingleVisLoss, UmapLoss, ReconLoss
 from singleVis.data_handler import DataHandler
 
 # Parameters

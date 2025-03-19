@@ -9,7 +9,7 @@ from singleVis.data_provider import DataProvider, NewDataProvider
 from singleVis.spatial_edge_constructor import SpatialEdgeConstructor
 from singleVis.temporal_edge_constructor import TemporalEdgeConstructor
 from singleVis.visualization_model import SingleVisualizationModel
-from singleVis.trainer import SingleVisTrainer
+from Project.TimeVisPlus.singleVis.trainer_rank import SingleVisTrainer
 from singleVis.backend import find_ab_params
 from singleVis.visualizer import DataVisualizer
 from singleVis.sampler import WeightedRandomSampler
@@ -91,7 +91,7 @@ model = SingleVisualizationModel(
 model = model.to(DEVICE)
 
 # Define loss
-from singleVis.losses import UmapLoss, ReconLoss, SingleVisLoss
+from Project.TimeVisPlus.singleVis.losses_rank import UmapLoss, ReconLoss, SingleVisLoss
 a, b = find_ab_params(1.0, 0.1)
 umap_loss = UmapLoss(
     negative_sample_rate=5,

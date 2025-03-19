@@ -6,7 +6,7 @@ from torch import nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.neighbors import NearestNeighbors
 from singleVis.data_provider import DataProvider, NewDataProvider
-from singleVis.spatial_edge_constructor import SpatialEdgeConstructor
+from singleVis.spatial_edge_constructor import SpatialEdgeConstructor, SimplifiedEdgeConstructor
 from singleVis.temporal_edge_constructor import TemporalEdgeConstructor
 from singleVis.visualization_model import SingleVisualizationModel
 from singleVis.trainer import SingleVisTrainer
@@ -14,10 +14,22 @@ from singleVis.backend import find_ab_params
 from singleVis.visualizer import DataVisualizer
 from singleVis.sampler import WeightedRandomSampler, TemporalPreservingSampler
 from singleVis.losses import UmapLoss, ReconLoss, SingleVisLoss, TemporalRankingLoss
+import matplotlib.pyplot as plt
+import argparse
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--select_idxs", nargs="+", type=int, default=1)
+
+    args = parser.parse_args()
+
+    return args
+
+args = parse_arguments()
 
 # Parameters
 # content_path = "/home/zicong/data/Code_Retrieval_Samples/merged_train_data/"
-content_path = "/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/training_dynamic/temporal_ranking/Model"
+content_path = "/home/zicong/data/training_dynamic/temporal_ranking/Model/"
 epoch_start = 1
 epoch_end = 50
 epoch_period = 1
@@ -43,48 +55,63 @@ T_N_EPOCHS = 100
 VARIANTS = "SVis"
 TEMP_TYPE = "local"
 SCHEDULE = None
-DEVICE = torch.device("cuda:0")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 max_samples = 1000
-VIS_MODEL_NAME = "tsvis"
-# selected_groups = [2]
+selected_idxs = args.select_idxs
+observe_idxs=[4,6,48]
+
+print("="*100)
+print(f"selected_idxs: {selected_idxs}")
+print("="*100)
 
 # Data Provider
 # data_provider = DataProvider(content_path, epoch_start, epoch_end, epoch_period, split, selected_groups=selected_groups)
-data_provider = NewDataProvider(content_path, epoch_start, epoch_end, epoch_period, split, max_samples=max_samples)
+data_provider = DataProvider(content_path, epoch_start, epoch_end, epoch_period, selected_idxs)
 
 
-# Construct Spatial-Temporal Complex
-spatial_cons = SpatialEdgeConstructor(
-    data_provider=data_provider,
-    init_num=INIT_NUM,
-    s_n_epochs=S_N_EPOCHS,
-    b_n_epochs=B_N_EPOCHS,
-    n_neighbors=n_neighbors,
-)
-s_edge_to, s_edge_from, s_probs, feature_vectors, time_step_nums, time_step_idxs_list = spatial_cons.construct()
+if len(selected_idxs) <= 2:
+    edge_constructor = SimplifiedEdgeConstructor(
+        data_provider=data_provider,
+        init_num=INIT_NUM,
+        s_n_epochs=S_N_EPOCHS,
+        b_n_epochs=B_N_EPOCHS,
+        n_neighbors=n_neighbors,
+    )
+    edge_to, edge_from, probs, feature_vectors, time_step_nums, time_step_idxs_list = edge_constructor.construct()
+    is_temporal = np.zeros(len(edge_to), dtype=bool)
+    is_temporal[len(edge_to):] = True  # Mark temporal edges
+else :
+    # Construct Spatial-Temporal Complex
+    spatial_cons = SpatialEdgeConstructor(
+        data_provider=data_provider,
+        init_num=INIT_NUM,
+        s_n_epochs=S_N_EPOCHS,
+        b_n_epochs=B_N_EPOCHS,
+        n_neighbors=n_neighbors,
+    )
+    s_edge_to, s_edge_from, s_probs, feature_vectors, time_step_nums, time_step_idxs_list = spatial_cons.construct()
 
-# Construct Temporal Complex
-temporal_cons = TemporalEdgeConstructor(
-    X=feature_vectors,
-    time_step_nums=time_step_nums,
-    n_neighbors=n_neighbors,
-    n_epochs=T_N_EPOCHS
-)
-t_edge_to, t_edge_from, t_probs = temporal_cons.construct()
+    # Construct Temporal Complex
+    temporal_cons = TemporalEdgeConstructor(
+        X=feature_vectors,
+        time_step_nums=time_step_nums,
+        n_neighbors=n_neighbors,
+        n_epochs=T_N_EPOCHS
+    )
+    t_edge_to, t_edge_from, t_probs = temporal_cons.construct()
 
-# Merge edges
-edge_to = np.concatenate((s_edge_to, t_edge_to), axis=0)
-edge_from = np.concatenate((s_edge_from, t_edge_from), axis=0)
-probs = np.concatenate((s_probs, t_probs), axis=0)
-probs = probs / (probs.max() + 1e-3)
-eliminate_zeros = probs > 1e-3
-edge_to = edge_to[eliminate_zeros]
-edge_from = edge_from[eliminate_zeros]
-probs = probs[eliminate_zeros]
-
-# Create temporal edge identifier array
-is_temporal = np.zeros(len(edge_to), dtype=bool)
-is_temporal[len(s_edge_to):] = True  # Mark temporal edges
+    # Merge edges
+    edge_to = np.concatenate((s_edge_to, t_edge_to), axis=0)
+    edge_from = np.concatenate((s_edge_from, t_edge_from), axis=0)
+    probs = np.concatenate((s_probs, t_probs), axis=0)
+    probs = probs / (probs.max() + 1e-3)
+    eliminate_zeros = probs > 1e-3
+    edge_to = edge_to[eliminate_zeros]
+    edge_from = edge_from[eliminate_zeros]
+    probs = probs[eliminate_zeros]
+    
+    is_temporal = np.zeros(len(edge_to), dtype=bool)
+    is_temporal[len(s_edge_to):] = True  # Mark temporal edges
 
 # Define the model
 model = SingleVisualizationModel(
@@ -106,10 +133,16 @@ umap_loss = UmapLoss(
     repulsion_strength=1.0
 )
 recon_loss = ReconLoss(beta=1.0)
-temporal_loss = TemporalRankingLoss(
-    data_provider=data_provider,
-    temporal_edges=(feature_vectors[t_edge_from], feature_vectors[t_edge_to])
-)
+if len(selected_idxs) <= 2:
+    temporal_loss = TemporalRankingLoss(
+        data_provider=data_provider,
+        temporal_edges=(edge_to, edge_from)
+    )
+else:
+    temporal_loss = TemporalRankingLoss(
+        data_provider=data_provider,
+        temporal_edges=(feature_vectors[t_edge_from], feature_vectors[t_edge_to])
+    )
 criterion = SingleVisLoss(
     umap_loss=umap_loss,
     recon_loss=recon_loss,
@@ -131,10 +164,8 @@ dataset = DataHandler(edge_to, edge_from, feature_vectors, is_temporal=is_tempor
 # n_samples = edge_to.shape[0]
 n_samples = int(np.sum(S_N_EPOCHS * probs) // 1)
 
-# 计算要采样的空间边数量
 num_spatial_samples = int(np.sum(S_N_EPOCHS * probs[~is_temporal]) // 1)
 
-# 创建采样器
 sampler = TemporalPreservingSampler(
     weights=probs,
     num_spatial_samples=num_spatial_samples,
@@ -142,7 +173,6 @@ sampler = TemporalPreservingSampler(
     edge_from=edge_from  # 添加edge_from参数
 )
 
-# 创建DataLoader
 edge_loader = DataLoader(
     dataset, 
     batch_size=2000,
@@ -161,12 +191,6 @@ trainer = SingleVisTrainer(
 
 # Train the model
 trainer.train(PATIENT=PATIENT, max_epochs=MAX_EPOCH)
-
-# save result
-save_dir = content_path
- ##### save the visulization model
-trainer.save(save_dir=save_dir, file_name="{}".format(VIS_MODEL_NAME))
-
 
 """
 # Visualization
@@ -371,10 +395,9 @@ def show_sample_ranking_preservation(data, embedding, n_neighbors=15, n_samples=
         high_neighbors = high_indices[idx]
         low_neighbors = low_indices[idx]
         
-        print("高维空间中的前5个邻居:")
+        print("高维空间中的前15个邻居:")
         print(f"{'邻居ID':<10}{'高维排名':<10}{'低维排名':<10}{'排名变化':<10}")
         for j, neighbor_id in enumerate(high_neighbors[:15]):
-            # 查找该邻居在低维空间中的排名
             low_rank = np.where(low_neighbors == neighbor_id)[0]
             if len(low_rank) > 0:
                 low_rank = low_rank[0]
@@ -382,7 +405,7 @@ def show_sample_ranking_preservation(data, embedding, n_neighbors=15, n_samples=
             else:
                 print(f"{neighbor_id:<10}{j:<10}{'不在前k中':<10}{'':<10}")
         
-        print("\n低维空间中的前5个邻居:")
+        print("\n低维空间中的前15个邻居:")
         print(f"{'邻居ID':<10}{'低维排名':<10}{'高维排名':<10}{'排名变化':<10}")
         for j, neighbor_id in enumerate(low_neighbors[:15]):
             high_rank = np.where(high_neighbors == neighbor_id)[0]
@@ -399,7 +422,10 @@ visualizer = DataVisualizer(
     save_path=os.path.join(content_path, "visualization_results", f"samples_{max_samples}")
 )
 
-for t in range(1,7,1):
+################## evaluate ##################
+
+"""
+for t in range(epoch_start,epoch_end+1,epoch_period):
     print(f"Processing epoch {t}")
     high_dim_data = data_provider.train_representation(epoch=t)
     if high_dim_data is None:
@@ -425,3 +451,208 @@ for t in range(1,7,1):
 
     visualizer.plot(epoch=t)
     print(f"Epoch {t} visualization saved.")
+"""
+
+print("\n==== 全局邻居排名保持性评估（所有epoch数据一起评估）====")
+
+all_high_dim_data = []
+all_embeddings = []
+epoch_indices = []  # 记录每个数据点来自哪个epoch
+
+for t in range(epoch_start, epoch_end+1, epoch_period):
+    high_dim_data = data_provider.train_representation(epoch=t)
+    if high_dim_data is None or len(high_dim_data) == 0:
+        print(f"No data found for epoch {t}, skipping...")
+        continue
+    
+    model.eval()
+    with torch.no_grad():
+        embedding = model.encoder(
+            torch.from_numpy(high_dim_data).to(dtype=torch.float32, device=DEVICE)
+        ).cpu().numpy()
+    
+    all_high_dim_data.append(high_dim_data)
+    all_embeddings.append(embedding)
+    epoch_indices.extend([t] * len(high_dim_data))
+
+if len(all_high_dim_data) > 0:
+    all_high_dim_data = np.vstack(all_high_dim_data)
+    all_embeddings = np.vstack(all_embeddings)
+    epoch_indices = np.array(epoch_indices)
+    
+    print(f"合并后的数据大小: {all_high_dim_data.shape}")
+    
+    # 计算全局的排名保持性
+    ranking_score, kendall_score, k_preservation_rate = evaluate_proj_nn_ranking_preservation(
+        all_high_dim_data, all_embeddings, n_neighbors=min(15, len(all_high_dim_data)-1), metric="euclidean"
+    )
+    print(f"全局Nearest Neighbor Ranking Preservation (Spearman): {ranking_score:.4f}")
+    print(f"全局Nearest Neighbor Ranking Preservation (Kendall): {kendall_score:.4f}")
+    print(f"全局K-Nearest Neighbor Preservation Rate: {k_preservation_rate:.4f}")
+    
+    show_sample_ranking_preservation(all_high_dim_data, all_embeddings, 
+                                    n_neighbors=min(15, len(all_high_dim_data)-1), 
+                                    n_samples=3)
+else:
+    print("没有找到有效的数据")
+
+print("\n==== 样本时间轨迹的邻居排名保持性评估 ====")
+
+if selected_idxs is not None:
+    for sample_idx in selected_idxs:
+        print(f"分析样本 #{sample_idx} 的时间轨迹")
+        sample_high_dim = []
+        sample_embeddings = []
+        valid_epochs = []
+        
+        for t in range(epoch_start, epoch_end+1, epoch_period):
+            high_dim_data = data_provider.train_representation(epoch=t, select_sample=[sample_idx])
+            if high_dim_data is None or len(high_dim_data) == 0:
+                continue
+                
+            if len(high_dim_data) > 0:
+                model.eval()
+                with torch.no_grad():
+                    embedding = model.encoder(
+                        torch.from_numpy(high_dim_data).to(dtype=torch.float32, device=DEVICE)
+                    ).cpu().numpy()
+                
+                sample_high_dim.append(high_dim_data)
+                sample_embeddings.append(embedding)
+                valid_epochs.append(t)
+        
+        if len(sample_high_dim) > 1:  # 需要至少两个时间点才能计算
+            sample_high_dim = np.vstack(sample_high_dim)
+            sample_embeddings = np.vstack(sample_embeddings)
+            
+            print(f"样本 #{sample_idx} 在 {len(valid_epochs)} 个epoch中出现")
+            print(f"有效的epochs: {valid_epochs}")
+            
+            if len(sample_high_dim) >= 3:  # 至少需要3个点才能计算相关系数
+                ranking_score, kendall_score, k_preservation_rate = evaluate_proj_nn_ranking_preservation(
+                    sample_high_dim, sample_embeddings, 
+                    n_neighbors=min(len(sample_high_dim)-1, 15), 
+                    metric="euclidean"
+                )
+                print(f"样本 #{sample_idx} 轨迹的Nearest Neighbor Ranking Preservation (Spearman): {ranking_score:.4f}")
+                print(f"样本 #{sample_idx} 轨迹的Nearest Neighbor Ranking Preservation (Kendall): {kendall_score:.4f}")
+                print(f"样本 #{sample_idx} 轨迹的K-Nearest Neighbor Preservation Rate: {k_preservation_rate:.4f}")
+                
+                plt.figure(figsize=(10, 8))
+                plt.plot(sample_embeddings[:, 0], sample_embeddings[:, 1], 'b-', alpha=0.5)
+                for i, epoch in enumerate(valid_epochs):
+                    plt.scatter(sample_embeddings[i, 0], sample_embeddings[i, 1], c='r', s=100)
+                    plt.text(sample_embeddings[i, 0], sample_embeddings[i, 1], f'E{epoch}', fontsize=12)
+                
+                plt.title(f"sample #{sample_idx} moving trace through epochs")
+                plt.xlabel("Dimension 1")
+                plt.ylabel("Dimension 2")
+                plt.grid(True, linestyle='--', alpha=0.7)
+                
+                trajectory_dir = os.path.join(content_path, "visualization_results", "trajectories")
+                os.makedirs(trajectory_dir, exist_ok=True)
+                plt.savefig(os.path.join(trajectory_dir, f"sample_{sample_idx}_trajectory.png"), dpi=300, bbox_inches='tight')
+                plt.close()
+                
+                print(f"样本 #{sample_idx} 的轨迹图已保存")
+            else:
+                print(f"样本 #{sample_idx} 的有效数据点不足以计算排名保持性 (需要至少3个点)")
+
+
+print("\n==== 样本空间邻居保持性评估 ====")
+
+if selected_idxs is not None:
+    sample_spatial_metrics = {idx: {'spearman': [], 'kendall': [], 'knn_rate': []} for idx in selected_idxs}
+    
+    for t in range(epoch_start, epoch_end+1, epoch_period):
+        print(f"\n分析 Epoch {t} 中所有样本的空间邻居保持性")
+        
+        high_dim_data = data_provider.train_representation(epoch=t)
+        if high_dim_data is None or len(high_dim_data) == 0:
+            print(f"Epoch {t} 没有找到数据，跳过...")
+            continue
+        
+        model.eval()
+        with torch.no_grad():
+            embedding = model.encoder(
+                torch.from_numpy(high_dim_data).to(dtype=torch.float32, device=DEVICE)
+            ).cpu().numpy()
+        
+        print(f"Epoch {t} 数据点数: {len(high_dim_data)}")
+        
+        # 如果数据点太少，跳过计算
+        if len(high_dim_data) < 2:
+            print(f"Epoch {t} 数据点数量不足以进行有意义的分析（少于3个点）")
+            continue
+        
+        for sample_idx in selected_idxs:
+            sample_data = data_provider.train_representation(epoch=t, select_sample=[sample_idx])
+            
+            if sample_data is None or len(sample_data) == 0:
+                print(f"样本 #{sample_idx} 在 Epoch {t} 中不存在")
+                continue
+            
+            # 计算当前样本的降维结果
+            model.eval()
+            with torch.no_grad():
+                sample_embedding = model.encoder(
+                    torch.from_numpy(sample_data).to(dtype=torch.float32, device=DEVICE)
+                ).cpu().numpy()
+            
+            n_neighbors_actual = min(15, len(high_dim_data)-1)
+            
+            from sklearn.metrics.pairwise import euclidean_distances
+            high_dim_distances = euclidean_distances(sample_data, high_dim_data)[0]
+            
+            low_dim_distances = euclidean_distances(sample_embedding, embedding)[0]
+            
+            self_idx = np.argmin(high_dim_distances)
+            
+            high_masked = np.delete(high_dim_distances, self_idx)
+            low_masked = np.delete(low_dim_distances, self_idx)
+            
+            original_indices = np.arange(len(high_dim_distances))
+            original_indices = np.delete(original_indices, self_idx)
+            
+            high_sorted_indices = np.argsort(high_masked)[:n_neighbors_actual]
+            low_sorted_indices = np.argsort(low_masked)[:n_neighbors_actual]
+            
+            high_neighbors = original_indices[high_sorted_indices]
+            low_neighbors = original_indices[low_sorted_indices]
+            
+            ranks_high_in_low = []
+            for neighbor in high_neighbors:
+                low_rank = np.where(low_neighbors == neighbor)[0]
+                if len(low_rank) > 0:
+                    ranks_high_in_low.append(low_rank[0])
+                else:
+                    ranks_high_in_low.append(n_neighbors_actual)  # 给一个比k大的排名
+            
+            reference_ranks = np.arange(n_neighbors_actual)
+            spearman_coeff, _ = spearmanr(reference_ranks, ranks_high_in_low)
+            kendall_coeff, _ = kendalltau(reference_ranks, ranks_high_in_low)
+            
+            # 计算K最近邻保持率
+            intersection = set(high_neighbors).intersection(set(low_neighbors))
+            knn_rate = len(intersection) / n_neighbors_actual
+            
+            sample_spatial_metrics[sample_idx]['spearman'].append(spearman_coeff)
+            sample_spatial_metrics[sample_idx]['kendall'].append(kendall_coeff)
+            sample_spatial_metrics[sample_idx]['knn_rate'].append(knn_rate)
+            
+            print(f"样本 #{sample_idx} 在 Epoch {t} 的空间邻居保持性: Spearman={spearman_coeff:.4f}, Kendall={kendall_coeff:.4f}, KNN保持率={knn_rate:.4f}")
+            
+            # 计算每个样本在所有epoch上的平均空间邻居保持性
+            print("\n==== 各样本在所有epoch上的平均空间邻居保持性 ====")
+            print(f"{'样本ID':<10}{'平均Spearman':<15}{'平均Kendall':<15}{'平均KNN保持率':<15}{'有效Epoch数':<15}")
+    
+    for sample_idx in selected_idxs:
+        spearman_scores = sample_spatial_metrics[sample_idx]['spearman']
+        kendall_scores = sample_spatial_metrics[sample_idx]['kendall']
+        knn_rates = sample_spatial_metrics[sample_idx]['knn_rate']
+        
+        if len(spearman_scores) > 0:
+            avg_spearman = np.mean(spearman_scores)
+            avg_kendall = np.mean(kendall_scores)
+            avg_knn_rate = np.mean(knn_rates)
+            print(f"{sample_idx:<10}{avg_spearman:.4f}{'':<7}{avg_kendall:.4f}{'':<7}{avg_knn_rate:.4f}{'':<7}{len(spearman_scores):<15}")
