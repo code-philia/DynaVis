@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.neighbors import NearestNeighbors
 from singleVis.data_provider import DataProvider, NewDataProvider
 from singleVis.spatial_edge_constructor import SpatialEdgeConstructor, SimplifiedEdgeConstructor
-from singleVis.temporal_edge_constructor import TemporalEdgeConstructor
+from singleVis.temporal_edge_constructor import TemporalEdgeConstructor, BaselineTemporalEdgeConstructor
 from singleVis.visualization_model import SingleVisualizationModel
 from singleVis.trainer import SingleVisTrainer
 from singleVis.backend import find_ab_params
@@ -92,7 +92,7 @@ else :
     s_edge_to, s_edge_from, s_probs, feature_vectors, time_step_nums, time_step_idxs_list = spatial_cons.construct()
 
     # Construct Temporal Complex
-    temporal_cons = TemporalEdgeConstructor(
+    temporal_cons = BaselineTemporalEdgeConstructor(
         X=feature_vectors,
         time_step_nums=time_step_nums,
         n_neighbors=n_neighbors,

@@ -99,7 +99,7 @@ class SingleVisTrainer:
             all_loss.append(loss.item())
             umap_losses.append(umap_l.item())
             recon_losses.append(recon_l.item())
-            temporal_losses.append(temporal_l.item())
+            # temporal_losses.append(temporal_l.item())
             
             # 反向传播
             self.optimizer.zero_grad()
@@ -113,7 +113,8 @@ class SingleVisTrainer:
         self.epoch_loss = sum(all_loss) / len(all_loss)
         self.epoch_umap_loss = sum(umap_losses) / len(umap_losses)
         self.epoch_recon_loss = sum(recon_losses) / len(recon_losses)
-        self.epoch_temporal_loss = sum(temporal_losses) / len(temporal_losses)
+        # self.epoch_temporal_loss = sum(temporal_losses) / len(temporal_losses)
+        self.epoch_temporal_loss = 0.0
 
     def train(self, PATIENT, max_epochs):
         patient = PATIENT
