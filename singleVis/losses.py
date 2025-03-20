@@ -204,8 +204,9 @@ class TemporalRankingLoss(nn.Module):
             for i in range(len(valid_to_keys)):
                 for k in range(i + 1, len(valid_to_keys)):
                     if high_ranks[i] < high_ranks[k] and D_low_valid[i] >= D_low_valid[k]:
-                        rank_diff = abs(high_ranks[i] - high_ranks[k])
-                        loss = loss + (D_low_valid[i] - D_low_valid[k]) * rank_diff
+                        # rank_diff = abs(high_ranks[i] - high_ranks[k])
+                        # loss = loss + (D_low_valid[i] - D_low_valid[k]) * rank_diff
+                        loss = loss + (D_low_valid[i] - D_low_valid[k])
                         valid_pairs += 1
         
         if valid_pairs == 0:
@@ -315,3 +316,92 @@ def listwise_ranking_loss(D_high, D_low, k=3):
     loss = F.kl_div(P_low.log(), P_high, reduction='batchmean')  # KL 散度损失
     return loss
 
+class UnifiedRankingLoss(nn.Module):
+    def __init__(self, edge_from, edge_to, device):
+        """
+        :param edge_from: 所有边的源节点特征
+        :param edge_to: 所有边的目标节点特征
+        :param device: 计算设备
+        """
+        super(UnifiedRankingLoss, self).__init__()
+        self.edge_from = torch.tensor(edge_from, device=device)
+        self.edge_to = torch.tensor(edge_to, device=device)
+        self.device = device
+        self.neighbor_ranks = self._precompute_neighbor_ranks()
+
+    def _precompute_neighbor_ranks(self):
+        """
+        Precompute the distance rank between each point and its neighbors.
+        :return: Dict[int, Dict[int, int]] 
+                {from_idx: {to_idx: rank}}
+        """
+        neighbor_ranks = {}
+        
+        # For each unique 'from' feature
+        unique_from = torch.unique(self.edge_from, dim=0)
+        
+        for from_feat in tqdm(unique_from, desc="Computing neighbor ranks"):
+            from_key = tuple(from_feat.tolist())  # Convert tensor to a tuple for use as a dictionary key
+            neighbor_ranks[from_key] = {}
+            
+            # Find all 'to' features corresponding to the current 'from'
+            mask = (self.edge_from == from_feat).all(dim=1)
+            curr_to_feats = self.edge_to[mask]
+            
+            # Compute distances to all neighbors
+            D = torch.norm(curr_to_feats - from_feat.unsqueeze(0), dim=1)
+            
+            # Get sorted indices
+            sorted_indices = torch.argsort(D)
+            
+            # Store the rank of each neighbor
+            for rank, idx in enumerate(sorted_indices):
+                to_key = tuple(curr_to_feats[idx].tolist())  # Convert tensor to a tuple for use as a dictionary key
+                neighbor_ranks[from_key][to_key] = rank
+        
+        return neighbor_ranks
+    
+    def forward(self, edge_to, edge_from, embedding_to, embedding_from, is_temporal):
+        """
+        :param edge_to: 当前batch中的目标节点特征
+        :param edge_from: 当前batch中的源节点特征
+        :param embedding_to: 目标节点的低维嵌入
+        :param embedding_from: 源节点的低维嵌入
+        """
+        loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        valid_pairs = 0
+        
+        # 对当前batch中的每个from节点
+        unique_from = torch.unique(edge_from, dim=0)
+        from_keys = [tuple(from_feat.tolist()) for from_feat in unique_from]
+        valid_from_keys = [key for key in from_keys if key in self.neighbor_ranks]
+        
+        for from_key in valid_from_keys:
+            precomputed_ranks = self.neighbor_ranks[from_key]
+            
+            # Ensure the tensor is on the same device
+            from_key_tensor = torch.tensor(from_key, device=self.device)
+            mask = torch.all(edge_from == from_key_tensor, dim=1)
+            curr_to_feats = edge_to[mask]
+            curr_to_embeds = embedding_to[mask]
+            curr_from_embed = embedding_from[mask][0]
+            
+            D_low = torch.norm(curr_to_embeds - curr_from_embed, dim=1)
+            
+            to_keys = [tuple(to_feat.tolist()) for to_feat in curr_to_feats]
+            valid_to_keys = [key for key in to_keys if key in precomputed_ranks]
+            
+            high_ranks = torch.tensor([precomputed_ranks[key] for key in valid_to_keys], device=self.device)
+            D_low_valid = D_low[[to_keys.index(key) for key in valid_to_keys]]
+            
+            for i in range(len(valid_to_keys)):
+                for k in range(i + 1, len(valid_to_keys)):
+                    if high_ranks[i] < high_ranks[k] and D_low_valid[i] >= D_low_valid[k]:
+                        rank_diff = abs(high_ranks[i] - high_ranks[k])
+                        loss = loss + (D_low_valid[i] - D_low_valid[k]) * rank_diff
+                        valid_pairs += 1
+        
+        if valid_pairs == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+        
+        return loss / valid_pairs

@@ -7,13 +7,13 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.neighbors import NearestNeighbors
 from singleVis.data_provider import DataProvider, NewDataProvider
 from singleVis.spatial_edge_constructor import SpatialEdgeConstructor
-from singleVis.temporal_edge_constructor import TemporalEdgeConstructor, BaselineTemporalEdgeConstructor
+from singleVis.temporal_edge_constructor import TemporalEdgeConstructor
 from singleVis.visualization_model import SingleVisualizationModel
 from singleVis.trainer import SingleVisTrainer
 from singleVis.backend import find_ab_params
 from singleVis.visualizer import DataVisualizer
 from singleVis.sampler import WeightedRandomSampler, TemporalPreservingSampler
-from singleVis.losses import UmapLoss, ReconLoss, SingleVisLoss, TemporalRankingLoss
+from singleVis.losses import UmapLoss, ReconLoss, SingleVisLoss, TemporalRankingLoss, UnifiedRankingLoss
 import matplotlib.pyplot as plt
 import argparse
 
@@ -28,8 +28,8 @@ import argparse
 # args = parse_arguments()
 
 # Parameters
-content_path = "/home/zicong/data/training_dynamic/temporal_ranking/Model/"
-#content_path = "/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/training_dynamic/temporal_ranking/Model"
+# content_path = "/home/zicong/data/Code_Retrieval_Samples/merged_train_data/"
+content_path = "/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/training_dynamic/temporal_ranking/Model"
 epoch_start = 1
 epoch_end = 50
 epoch_period = 1
@@ -143,6 +143,13 @@ else:
         data_provider=data_provider,
         temporal_edges=(feature_vectors[t_edge_from], feature_vectors[t_edge_to])
     )
+    
+# temporal_loss = UnifiedRankingLoss(
+#     edge_from=feature_vectors[edge_from],
+#     edge_to=feature_vectors[edge_to],
+#     device=DEVICE
+# )
+
 criterion = SingleVisLoss(
     umap_loss=umap_loss,
     recon_loss=recon_loss,
@@ -166,13 +173,14 @@ n_samples = int(np.sum(S_N_EPOCHS * probs) // 1)
 
 num_spatial_samples = int(np.sum(S_N_EPOCHS * probs[~is_temporal]) // 1)
 
-sampler = TemporalPreservingSampler(
-    weights=probs,
-    num_spatial_samples=num_spatial_samples,
-    is_temporal=is_temporal,
-    edge_from=edge_from,
-    edge_to=edge_to
-)
+# sampler = TemporalPreservingSampler(
+#     weights=probs,
+#     num_spatial_samples=num_spatial_samples,
+#     is_temporal=is_temporal,
+#     edge_from=edge_from,
+#     edge_to=edge_to
+# )
+sampler = WeightedRandomSampler(probs, n_samples, replacement=True)
 
 edge_loader = DataLoader(
     dataset, 
@@ -500,6 +508,11 @@ else:
 print("\n==== 样本时间轨迹的邻居排名保持性评估 ====")
 
 if selected_idxs is not None:
+    total_ranking_score = 0
+    total_kendall_score = 0
+    total_k_preservation_rate = 0
+    valid_sample_count = 0
+
     for sample_idx in selected_idxs:
         print(f"分析样本 #{sample_idx} 的时间轨迹")
         sample_high_dim = []
@@ -539,6 +552,11 @@ if selected_idxs is not None:
                 print(f"样本 #{sample_idx} 轨迹的Nearest Neighbor Ranking Preservation (Kendall): {kendall_score:.4f}")
                 print(f"样本 #{sample_idx} 轨迹的K-Nearest Neighbor Preservation Rate: {k_preservation_rate:.4f}")
                 
+                total_ranking_score += ranking_score
+                total_kendall_score += kendall_score
+                total_k_preservation_rate += k_preservation_rate
+                valid_sample_count += 1
+                
                 plt.figure(figsize=(10, 8))
                 plt.plot(sample_embeddings[:, 0], sample_embeddings[:, 1], 'b-', alpha=0.5)
                 for i, epoch in enumerate(valid_epochs):
@@ -559,101 +577,111 @@ if selected_idxs is not None:
             else:
                 print(f"样本 #{sample_idx} 的有效数据点不足以计算排名保持性 (需要至少3个点)")
 
+    if valid_sample_count > 0:
+        avg_ranking_score = total_ranking_score / valid_sample_count
+        avg_kendall_score = total_kendall_score / valid_sample_count
+        avg_k_preservation_rate = total_k_preservation_rate / valid_sample_count
+        print(f"所有样本的平均 Nearest Neighbor Ranking Preservation (Spearman): {avg_ranking_score:.4f}")
+        print(f"所有样本的平均 Nearest Neighbor Ranking Preservation (Kendall): {avg_kendall_score:.4f}")
+        print(f"所有样本的平均 K-Nearest Neighbor Preservation Rate: {avg_k_preservation_rate:.4f}")
+    else:
+        print("没有足够的有效样本来计算平均值")
 
-print("\n==== 样本空间邻居保持性评估 ====")
 
-if selected_idxs is not None:
-    sample_spatial_metrics = {idx: {'spearman': [], 'kendall': [], 'knn_rate': []} for idx in selected_idxs}
+# print("\n==== 样本空间邻居保持性评估 ====")
+
+# if selected_idxs is not None:
+#     sample_spatial_metrics = {idx: {'spearman': [], 'kendall': [], 'knn_rate': []} for idx in selected_idxs}
     
-    for t in range(epoch_start, epoch_end+1, epoch_period):
-        print(f"\n分析 Epoch {t} 中所有样本的空间邻居保持性")
+#     for t in range(epoch_start, epoch_end+1, epoch_period):
+#         print(f"\n分析 Epoch {t} 中所有样本的空间邻居保持性")
         
-        high_dim_data = data_provider.train_representation(epoch=t)
-        if high_dim_data is None or len(high_dim_data) == 0:
-            print(f"Epoch {t} 没有找到数据，跳过...")
-            continue
+#         high_dim_data = data_provider.train_representation(epoch=t)
+#         if high_dim_data is None or len(high_dim_data) == 0:
+#             print(f"Epoch {t} 没有找到数据，跳过...")
+#             continue
         
-        model.eval()
-        with torch.no_grad():
-            embedding = model.encoder(
-                torch.from_numpy(high_dim_data).to(dtype=torch.float32, device=DEVICE)
-            ).cpu().numpy()
+#         model.eval()
+#         with torch.no_grad():
+#             embedding = model.encoder(
+#                 torch.from_numpy(high_dim_data).to(dtype=torch.float32, device=DEVICE)
+#             ).cpu().numpy()
         
-        print(f"Epoch {t} 数据点数: {len(high_dim_data)}")
+#         print(f"Epoch {t} 数据点数: {len(high_dim_data)}")
         
-        # 如果数据点太少，跳过计算
-        if len(high_dim_data) < 2:
-            print(f"Epoch {t} 数据点数量不足以进行有意义的分析（少于3个点）")
-            continue
+#         # 如果数据点太少，跳过计算
+#         if len(high_dim_data) < 2:
+#             print(f"Epoch {t} 数据点数量不足以进行有意义的分析（少于3个点）")
+#             continue
         
-        for sample_idx in selected_idxs:
-            sample_data = data_provider.train_representation(epoch=t, select_sample=[sample_idx])
+#         for sample_idx in selected_idxs:
+#             sample_data = data_provider.train_representation(epoch=t, select_sample=[sample_idx])
             
-            if sample_data is None or len(sample_data) == 0:
-                print(f"样本 #{sample_idx} 在 Epoch {t} 中不存在")
-                continue
+#             if sample_data is None or len(sample_data) == 0:
+#                 print(f"样本 #{sample_idx} 在 Epoch {t} 中不存在")
+#                 continue
             
-            # 计算当前样本的降维结果
-            model.eval()
-            with torch.no_grad():
-                sample_embedding = model.encoder(
-                    torch.from_numpy(sample_data).to(dtype=torch.float32, device=DEVICE)
-                ).cpu().numpy()
+#             # 计算当前样本的降维结果
+#             model.eval()
+#             with torch.no_grad():
+#                 sample_embedding = model.encoder(
+#                     torch.from_numpy(sample_data).to(dtype=torch.float32, device=DEVICE)
+#                 ).cpu().numpy()
             
-            n_neighbors_actual = min(15, len(high_dim_data)-1)
+#             n_neighbors_actual = min(15, len(high_dim_data)-1)
             
-            from sklearn.metrics.pairwise import euclidean_distances
-            high_dim_distances = euclidean_distances(sample_data, high_dim_data)[0]
+#             from sklearn.metrics.pairwise import euclidean_distances
+#             high_dim_distances = euclidean_distances(sample_data, high_dim_data)[0]
             
-            low_dim_distances = euclidean_distances(sample_embedding, embedding)[0]
+#             low_dim_distances = euclidean_distances(sample_embedding, embedding)[0]
             
-            self_idx = np.argmin(high_dim_distances)
+#             self_idx = np.argmin(high_dim_distances)
             
-            high_masked = np.delete(high_dim_distances, self_idx)
-            low_masked = np.delete(low_dim_distances, self_idx)
+#             high_masked = np.delete(high_dim_distances, self_idx)
+#             low_masked = np.delete(low_dim_distances, self_idx)
             
-            original_indices = np.arange(len(high_dim_distances))
-            original_indices = np.delete(original_indices, self_idx)
+#             original_indices = np.arange(len(high_dim_distances))
+#             original_indices = np.delete(original_indices, self_idx)
             
-            high_sorted_indices = np.argsort(high_masked)[:n_neighbors_actual]
-            low_sorted_indices = np.argsort(low_masked)[:n_neighbors_actual]
+#             high_sorted_indices = np.argsort(high_masked)[:n_neighbors_actual]
+#             low_sorted_indices = np.argsort(low_masked)[:n_neighbors_actual]
             
-            high_neighbors = original_indices[high_sorted_indices]
-            low_neighbors = original_indices[low_sorted_indices]
+#             high_neighbors = original_indices[high_sorted_indices]
+#             low_neighbors = original_indices[low_sorted_indices]
             
-            ranks_high_in_low = []
-            for neighbor in high_neighbors:
-                low_rank = np.where(low_neighbors == neighbor)[0]
-                if len(low_rank) > 0:
-                    ranks_high_in_low.append(low_rank[0])
-                else:
-                    ranks_high_in_low.append(n_neighbors_actual)  # 给一个比k大的排名
+#             ranks_high_in_low = []
+#             for neighbor in high_neighbors:
+#                 low_rank = np.where(low_neighbors == neighbor)[0]
+#                 if len(low_rank) > 0:
+#                     ranks_high_in_low.append(low_rank[0])
+#                 else:
+#                     ranks_high_in_low.append(n_neighbors_actual)  # 给一个比k大的排名
             
-            reference_ranks = np.arange(n_neighbors_actual)
-            spearman_coeff, _ = spearmanr(reference_ranks, ranks_high_in_low)
-            kendall_coeff, _ = kendalltau(reference_ranks, ranks_high_in_low)
+#             reference_ranks = np.arange(n_neighbors_actual)
+#             spearman_coeff, _ = spearmanr(reference_ranks, ranks_high_in_low)
+#             kendall_coeff, _ = kendalltau(reference_ranks, ranks_high_in_low)
             
-            # 计算K最近邻保持率
-            intersection = set(high_neighbors).intersection(set(low_neighbors))
-            knn_rate = len(intersection) / n_neighbors_actual
+#             # 计算K最近邻保持率
+#             intersection = set(high_neighbors).intersection(set(low_neighbors))
+#             knn_rate = len(intersection) / n_neighbors_actual
             
-            sample_spatial_metrics[sample_idx]['spearman'].append(spearman_coeff)
-            sample_spatial_metrics[sample_idx]['kendall'].append(kendall_coeff)
-            sample_spatial_metrics[sample_idx]['knn_rate'].append(knn_rate)
+#             sample_spatial_metrics[sample_idx]['spearman'].append(spearman_coeff)
+#             sample_spatial_metrics[sample_idx]['kendall'].append(kendall_coeff)
+#             sample_spatial_metrics[sample_idx]['knn_rate'].append(knn_rate)
             
-            print(f"样本 #{sample_idx} 在 Epoch {t} 的空间邻居保持性: Spearman={spearman_coeff:.4f}, Kendall={kendall_coeff:.4f}, KNN保持率={knn_rate:.4f}")
+#             print(f"样本 #{sample_idx} 在 Epoch {t} 的空间邻居保持性: Spearman={spearman_coeff:.4f}, Kendall={kendall_coeff:.4f}, KNN保持率={knn_rate:.4f}")
             
-            # 计算每个样本在所有epoch上的平均空间邻居保持性
-            print("\n==== 各样本在所有epoch上的平均空间邻居保持性 ====")
-            print(f"{'样本ID':<10}{'平均Spearman':<15}{'平均Kendall':<15}{'平均KNN保持率':<15}{'有效Epoch数':<15}")
+#             # 计算每个样本在所有epoch上的平均空间邻居保持性
+#             print("\n==== 各样本在所有epoch上的平均空间邻居保持性 ====")
+#             print(f"{'样本ID':<10}{'平均Spearman':<15}{'平均Kendall':<15}{'平均KNN保持率':<15}{'有效Epoch数':<15}")
     
-    for sample_idx in selected_idxs:
-        spearman_scores = sample_spatial_metrics[sample_idx]['spearman']
-        kendall_scores = sample_spatial_metrics[sample_idx]['kendall']
-        knn_rates = sample_spatial_metrics[sample_idx]['knn_rate']
+#     for sample_idx in selected_idxs:
+#         spearman_scores = sample_spatial_metrics[sample_idx]['spearman']
+#         kendall_scores = sample_spatial_metrics[sample_idx]['kendall']
+#         knn_rates = sample_spatial_metrics[sample_idx]['knn_rate']
         
-        if len(spearman_scores) > 0:
-            avg_spearman = np.mean(spearman_scores)
-            avg_kendall = np.mean(kendall_scores)
-            avg_knn_rate = np.mean(knn_rates)
-            print(f"{sample_idx:<10}{avg_spearman:.4f}{'':<7}{avg_kendall:.4f}{'':<7}{avg_knn_rate:.4f}{'':<7}{len(spearman_scores):<15}")
+#         if len(spearman_scores) > 0:
+#             avg_spearman = np.mean(spearman_scores)
+#             avg_kendall = np.mean(kendall_scores)
+#             avg_knn_rate = np.mean(knn_rates)
+#             print(f"{sample_idx:<10}{avg_spearman:.4f}{'':<7}{avg_kendall:.4f}{'':<7}{avg_knn_rate:.4f}{'':<7}{len(spearman_scores):<15}")
