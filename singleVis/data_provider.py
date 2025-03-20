@@ -30,23 +30,27 @@ class DataProvider:
         try:
             if select_sample is not None:
                 select_idxs = select_sample
-            else :
+            else:
                 select_idxs = self.select_idxs
-            data_path = self.train_epochs.get(epoch)
-            if not data_path:
+
+            dir_name = f"Epoch_{epoch}"
+            dir_path = os.path.join(self.content_path, dir_name)
+            data_path = os.path.join(dir_path, "train_data.npy")
+
+            if not os.path.isfile(data_path):
                 print(f"Epoch {epoch} not found in train_epochs.")
                 return None
-            
+
             data = np.load(data_path)
-            
+
             if select_idxs is not None:
                 data = data[select_idxs]
-                
+
             return data
         except Exception as e:
             print(f"Error loading data for Epoch {epoch}: {e}")
             return None
-            
+
     def get_available_epochs(self):
         return sorted(list(self.train_epochs.keys()))
 

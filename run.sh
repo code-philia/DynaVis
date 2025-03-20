@@ -37,7 +37,7 @@ do
     
     echo "run times #$i: sample idx list $RANDOM_NUMBERS"
     
-    python main_test.py --select_idxs $RANDOM_NUMBERS >> ./log/${LOG_FILENAME}.log 2>&1
+    python main.py --select_idxs $RANDOM_NUMBERS >> ./log/${LOG_FILENAME}.log 2>&1
     
 done
 

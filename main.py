@@ -6,7 +6,7 @@ from torch import nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.neighbors import NearestNeighbors
 from singleVis.data_provider import DataProvider, NewDataProvider
-from singleVis.spatial_edge_constructor import SpatialEdgeConstructor, SimplifiedEdgeConstructor
+from singleVis.spatial_edge_constructor import SpatialEdgeConstructor
 from singleVis.temporal_edge_constructor import TemporalEdgeConstructor, BaselineTemporalEdgeConstructor
 from singleVis.visualization_model import SingleVisualizationModel
 from singleVis.trainer import SingleVisTrainer
@@ -17,19 +17,19 @@ from singleVis.losses import UmapLoss, ReconLoss, SingleVisLoss, TemporalRanking
 import matplotlib.pyplot as plt
 import argparse
 
-def parse_arguments():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--select_idxs", nargs="+", type=int, default=1)
+# def parse_arguments():
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument("--select_idxs", nargs="+", type=int, default=1)
 
-    args = parser.parse_args()
+#     args = parser.parse_args()
 
-    return args
+#     return args
 
-args = parse_arguments()
+# args = parse_arguments()
 
 # Parameters
-# content_path = "/home/zicong/data/Code_Retrieval_Samples/merged_train_data/"
 content_path = "/home/zicong/data/training_dynamic/temporal_ranking/Model/"
+#content_path = "/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/training_dynamic/temporal_ranking/Model"
 epoch_start = 1
 epoch_end = 50
 epoch_period = 1
@@ -47,17 +47,17 @@ persistence = 0
 INIT_NUM = 100
 ALPHA = 0.0
 BETA = 0.1
-MAX_EPOCH = 20
-PATIENT = 5
+MAX_EPOCH = 15
+PATIENT = 3
 S_N_EPOCHS = 5
 B_N_EPOCHS = 5
 T_N_EPOCHS = 100
 VARIANTS = "SVis"
 TEMP_TYPE = "local"
 SCHEDULE = None
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 max_samples = 1000
-selected_idxs = args.select_idxs
+selected_idxs = list(range(96))
 observe_idxs=[4,6,48]
 
 print("="*100)
@@ -92,7 +92,7 @@ else :
     s_edge_to, s_edge_from, s_probs, feature_vectors, time_step_nums, time_step_idxs_list = spatial_cons.construct()
 
     # Construct Temporal Complex
-    temporal_cons = BaselineTemporalEdgeConstructor(
+    temporal_cons = TemporalEdgeConstructor(
         X=feature_vectors,
         time_step_nums=time_step_nums,
         n_neighbors=n_neighbors,
@@ -127,7 +127,7 @@ model = model.to(DEVICE)
 a, b = find_ab_params(1.0, 0.1)
 umap_loss = UmapLoss(
     negative_sample_rate=5,
-    device="cuda",
+    device=DEVICE,
     a=a,
     b=b,
     repulsion_strength=1.0
@@ -170,7 +170,8 @@ sampler = TemporalPreservingSampler(
     weights=probs,
     num_spatial_samples=num_spatial_samples,
     is_temporal=is_temporal,
-    edge_from=edge_from  # 添加edge_from参数
+    edge_from=edge_from,
+    edge_to=edge_to
 )
 
 edge_loader = DataLoader(
