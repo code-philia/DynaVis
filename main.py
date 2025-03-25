@@ -16,6 +16,7 @@ from singleVis.sampler import WeightedRandomSampler, TemporalPreservingSampler
 from singleVis.losses import UmapLoss, ReconLoss, SingleVisLoss, TemporalRankingLoss, UnifiedRankingLoss
 import matplotlib.pyplot as plt
 import argparse
+from tqdm import tqdm
 
 # def parse_arguments():
 #     parser = argparse.ArgumentParser()
@@ -29,12 +30,12 @@ import argparse
 
 # Parameters
 # content_path = "/home/zicong/data/Code_Retrieval_Samples/merged_train_data/"
-content_path = "/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/liuyiming-240108540153/training_dynamic/temporal_ranking/Model"
+content_path = "/home/yiming/cophi/projects/fork/backdoor_attack/dynamic/BadNet_MNIST_noise_salt_pepper_s0_t1/Model"
 epoch_start = 1
 epoch_end = 50
 epoch_period = 1
 split = 0
-input_dims = 768  # Adjust according to your data
+input_dims = 512  # Adjust according to your data
 output_dims = 2
 units = 256
 hidden_layer = 3
@@ -57,7 +58,7 @@ TEMP_TYPE = "local"
 SCHEDULE = None
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 max_samples = 1000
-selected_idxs = list(range(96))
+selected_idxs = list(range(118))
 observe_idxs=[4,6,48]
 
 print("="*100)
@@ -122,7 +123,11 @@ model = SingleVisualizationModel(
     device=DEVICE
 )
 model = model.to(DEVICE)
-
+# model_path = "/home/yiming/cophi/projects/fork/backdoor_attack/dynamic/BadNet_MNIST_noise_salt_pepper_s0_t1/Model"
+# model_file = next(f for f in os.listdir(model_path) if f.endswith('.pth'))
+# checkpoint = torch.load(os.path.join(model_path, model_file))
+# model.load_state_dict(checkpoint['state_dict'])
+# model.eval()
 # Define loss
 a, b = find_ab_params(1.0, 0.1)
 umap_loss = UmapLoss(
@@ -200,6 +205,8 @@ trainer = SingleVisTrainer(
 
 # Train the model
 trainer.train(PATIENT=PATIENT, max_epochs=MAX_EPOCH)
+# trainer.save(content_path, "TimeVisPlus")
+trainer.save(content_path, "TimeVisPlus_2")
 
 """
 # Visualization
@@ -685,3 +692,78 @@ if selected_idxs is not None:
 #             avg_kendall = np.mean(kendall_scores)
 #             avg_knn_rate = np.mean(knn_rates)
 #             print(f"{sample_idx:<10}{avg_spearman:.4f}{'':<7}{avg_kendall:.4f}{'':<7}{avg_knn_rate:.4f}{'':<7}{len(spearman_scores):<15}")
+
+def evaluate_movement_rate_preservation(selected_idxs, data_provider, model, device, top_k=3):
+    """
+    评估高维和低维空间中运动速率的保持程度
+    
+    Args:
+        data_provider: 数据提供者
+        model: 训练好的模型
+        device: 计算设备
+        top_k: 要比较的最快移动epoch数量
+    
+    Returns:
+        float: 平均重合率
+    """
+    model.eval()
+    
+    # 获取所有样本ID
+    all_samples = selected_idxs
+    preservation_rates = []
+    
+    for sample_idx in tqdm(all_samples, desc="Evaluating movement rate preservation"):
+        high_dim_velocities = []  # 存储高维空间中的移动速度
+        low_dim_velocities = []   # 存储低维空间中的移动速度
+        valid_epochs = []         # 存储有效的epoch对
+        
+        # 计算每相邻epoch之间的移动速度
+        for t in range(epoch_start, epoch_end+1, epoch_period):
+            # 获取当前epoch和下一个epoch的高维表示
+            curr_high_dim = data_provider.train_representation(epoch=t, select_sample=[sample_idx])
+            next_high_dim = data_provider.train_representation(epoch=t+1, select_sample=[sample_idx])
+            
+            if curr_high_dim is None or next_high_dim is None or len(curr_high_dim) == 0 or len(next_high_dim) == 0:
+                continue
+                
+            # 计算低维嵌入
+            with torch.no_grad():
+                curr_low_dim = model.encoder(torch.from_numpy(curr_high_dim).to(dtype=torch.float32, device=device)).cpu().numpy()
+                next_low_dim = model.encoder(torch.from_numpy(next_high_dim).to(dtype=torch.float32, device=device)).cpu().numpy()
+            
+            # 计算高维和低维空间中的移动距离
+            high_dim_velocity = np.linalg.norm(next_high_dim - curr_high_dim)
+            low_dim_velocity = np.linalg.norm(next_low_dim - curr_low_dim)
+            
+            high_dim_velocities.append(high_dim_velocity)
+            low_dim_velocities.append(low_dim_velocity)
+            valid_epochs.append(t)
+        
+        if len(valid_epochs) < top_k:
+            continue
+            
+        # 找到高维空间中移动最快的k个epoch
+        high_dim_velocities = np.array(high_dim_velocities)
+        low_dim_velocities = np.array(low_dim_velocities)
+        
+        top_k_high = set(np.argsort(high_dim_velocities)[-top_k:])
+        top_k_low = set(np.argsort(low_dim_velocities)[-top_k:])
+        
+        # 计算重合率
+        overlap = len(top_k_high.intersection(top_k_low))
+        preservation_rate = overlap / top_k
+        preservation_rates.append(preservation_rate)
+        
+        # 打印每个样本的详细信息
+        print(f"\nSample #{sample_idx}:")
+        print(f"Top {top_k} fastest moving epochs in high-dim: {[valid_epochs[i] for i in sorted(top_k_high)]}")
+        print(f"Top {top_k} fastest moving epochs in low-dim: {[valid_epochs[i] for i in sorted(top_k_low)]}")
+        print(f"Preservation rate: {preservation_rate:.4f}")
+    
+    mean_preservation_rate = np.mean(preservation_rates) if preservation_rates else 0.0
+    print(f"\nAverage movement rate preservation: {mean_preservation_rate:.4f}")
+    return mean_preservation_rate
+
+print("\n==== 评估运动速率保持程度 ====")
+movement_preservation = evaluate_movement_rate_preservation(selected_idxs, data_provider, model, DEVICE)
+print(f"Overall movement rate preservation score: {movement_preservation:.4f}")

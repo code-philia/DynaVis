@@ -237,8 +237,9 @@ class SingleVisLoss(nn.Module):
         # UMAP loss
         umap_loss = self.umap_loss(embedding_to, embedding_from)
         
-        # Reconstruction loss
-        recon_loss = self.recon_loss(edge_to, edge_from, recon_to, recon_from)
+        # Reconstruction loss (disabled)
+        # recon_loss = self.recon_loss(edge_to, edge_from, recon_to, recon_from)
+        recon_loss = torch.tensor(0.0, device=edge_from.device)
         
         # Temporal ranking loss
         temporal_loss = 0.0
@@ -251,7 +252,8 @@ class SingleVisLoss(nn.Module):
                 is_temporal
             )
         
-        total_loss = umap_loss + self.lambd * recon_loss + self.gamma * temporal_loss
+        # Remove recon_loss from total loss calculation
+        total_loss = umap_loss + self.gamma * temporal_loss
         
         return umap_loss, recon_loss, temporal_loss, total_loss
 
