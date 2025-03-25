@@ -13,7 +13,7 @@ from singleVis.trainer import SingleVisTrainer
 from singleVis.backend import find_ab_params
 from singleVis.visualizer import DataVisualizer
 from singleVis.sampler import WeightedRandomSampler, TemporalPreservingSampler
-from singleVis.losses import UmapLoss, ReconLoss, SingleVisLoss, TemporalRankingLoss, UnifiedRankingLoss
+from singleVis.losses import UmapLoss, ReconLoss, SingleVisLoss, TemporalRankingLoss, UnifiedRankingLoss, TemporalVelocityLoss
 import matplotlib.pyplot as plt
 import argparse
 from tqdm import tqdm
@@ -30,7 +30,7 @@ from tqdm import tqdm
 
 # Parameters
 # content_path = "/home/zicong/data/Code_Retrieval_Samples/merged_train_data/"
-content_path = "/home/yiming/cophi/projects/fork/backdoor_attack/dynamic/BadNet_MNIST_noise_salt_pepper_s0_t1/Model"
+content_path = "/home/yiming/cophi/projects/fork/backdoor_attack/dynamic/BadNet_MNIST_noise_salt_pepper_s0_t0/Model"
 epoch_start = 1
 epoch_end = 50
 epoch_period = 1
@@ -123,8 +123,8 @@ model = SingleVisualizationModel(
     device=DEVICE
 )
 model = model.to(DEVICE)
-# model_path = "/home/yiming/cophi/projects/fork/backdoor_attack/dynamic/BadNet_MNIST_noise_salt_pepper_s0_t1/Model"
-# model_file = next(f for f in os.listdir(model_path) if f.endswith('.pth'))
+# model_path = "/home/yiming/cophi/projects/fork/backdoor_attack/dynamic/BadNet_MNIST_noise_salt_pepper_s0_t0/Model"
+# model_file = 'TimeVisPlus_2.pth'
 # checkpoint = torch.load(os.path.join(model_path, model_file))
 # model.load_state_dict(checkpoint['state_dict'])
 # model.eval()
@@ -148,19 +148,18 @@ else:
         data_provider=data_provider,
         temporal_edges=(feature_vectors[t_edge_from], feature_vectors[t_edge_to])
     )
-    
-# temporal_loss = UnifiedRankingLoss(
-#     edge_from=feature_vectors[edge_from],
-#     edge_to=feature_vectors[edge_to],
-#     device=DEVICE
-# )
+
+# Add velocity loss
+velocity_loss = TemporalVelocityLoss(temperature=1)  # 可以调整temperature参数
 
 criterion = SingleVisLoss(
     umap_loss=umap_loss,
     recon_loss=recon_loss,
     temporal_loss=temporal_loss,
+    velocity_loss=velocity_loss,  # 添加velocity loss
     lambd=1.0,
-    gamma=3.0  # Control temporal ranking loss weight
+    gamma=3.0,  # temporal ranking loss权重
+    delta=2.0   # velocity loss权重，可以调整
 )
 
 # Define optimizer and lr_scheduler
@@ -756,9 +755,7 @@ def evaluate_movement_rate_preservation(selected_idxs, data_provider, model, dev
         
         # 打印每个样本的详细信息
         print(f"\nSample #{sample_idx}:")
-        print(f"Top {top_k} fastest moving epochs in high-dim: {[valid_epochs[i] for i in sorted(top_k_high)]}")
-        print(f"Top {top_k} fastest moving epochs in low-dim: {[valid_epochs[i] for i in sorted(top_k_low)]}")
-        print(f"Preservation rate: {preservation_rate:.4f}")
+        print(f"Top {top_k} fastest moving epochs in high-dim: {[valid_epochs[i] for i in sorted(top_k_high)]}", f"Top {top_k} fastest moving epochs in low-dim: {[valid_epochs[i] for i in sorted(top_k_low)]}",f"Preservation rate: {preservation_rate:.4f}")
     
     mean_preservation_rate = np.mean(preservation_rates) if preservation_rates else 0.0
     print(f"\nAverage movement rate preservation: {mean_preservation_rate:.4f}")

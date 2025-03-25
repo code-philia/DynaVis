@@ -74,6 +74,7 @@ class SingleVisTrainer:
         umap_losses = []
         recon_losses = []
         temporal_losses = []
+        velocity_losses = []
 
         t = tqdm(self.edge_loader, leave=True, total=len(self.edge_loader))
         for data in t:
@@ -88,7 +89,7 @@ class SingleVisTrainer:
             outputs = self.model(edge_to, edge_from)
             
             # 计算损失
-            umap_l, recon_l, temporal_l, loss = self.criterion(
+            umap_l, recon_l, temporal_l, velocity_l, loss = self.criterion(
                 edge_to, 
                 edge_from, 
                 outputs,
@@ -100,6 +101,7 @@ class SingleVisTrainer:
             umap_losses.append(umap_l.item())
             recon_losses.append(recon_l.item())
             temporal_losses.append(temporal_l.item())
+            velocity_losses.append(velocity_l.item())
             
             # 反向传播
             self.optimizer.zero_grad()
@@ -114,6 +116,7 @@ class SingleVisTrainer:
         self.epoch_umap_loss = sum(umap_losses) / len(umap_losses)
         self.epoch_recon_loss = sum(recon_losses) / len(recon_losses)
         self.epoch_temporal_loss = sum(temporal_losses) / len(temporal_losses)
+        self.epoch_velocity_loss = sum(velocity_losses) / len(velocity_losses)
 
     def train(self, PATIENT, max_epochs):
         patient = PATIENT
@@ -125,7 +128,11 @@ class SingleVisTrainer:
             prev_loss = self._loss
             self.train_step()
 
-            print(f"UMAP Loss: {self.epoch_umap_loss:.4f}, Recon Loss: {self.epoch_recon_loss:.4f}, Temporal Loss: {self.epoch_temporal_loss:.4f}, Total Loss: {self._loss:.4f}")
+            print(f"UMAP Loss: {self.epoch_umap_loss:.4f}, "
+                  f"Recon Loss: {self.epoch_recon_loss:.4f}, "
+                  f"Temporal Loss: {self.epoch_temporal_loss:.4f}, "
+                  f"Velocity Loss: {self.epoch_velocity_loss:.4f}, "
+                  f"Total Loss: {self._loss:.4f}")
 
             if prev_loss - self._loss < 1E-2:
                 if patient == 0:

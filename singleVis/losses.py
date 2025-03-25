@@ -215,14 +215,88 @@ class TemporalRankingLoss(nn.Module):
         return loss / valid_pairs
 
 
+class TemporalVelocityLoss(nn.Module):
+    def __init__(self, temperature=1.0):
+        """
+        计算高维和低维空间中时序运动相似度的一致性损失
+        
+        Args:
+            temperature: 控制相似度计算的温度参数
+        """
+        super(TemporalVelocityLoss, self).__init__()
+        self.temperature = temperature
+        
+    def compute_normalized_similarity(self, x1, x2, batch_wise=True):
+        """
+        计算归一化后的相似度
+        
+        Args:
+            x1, x2: 需要计算距离的两组向量
+            batch_wise: 是否在batch内进行归一化
+        """
+        # 计算欧氏距离
+        dist = torch.norm(x1 - x2, dim=1)
+        
+        if batch_wise:
+            # 在batch内进行min-max归一化
+            min_dist = torch.min(dist)
+            max_dist = torch.max(dist)
+            if max_dist - min_dist > 1e-8:  # 避免除零
+                dist = (dist - min_dist) / (max_dist - min_dist)
+            else:
+                dist = torch.zeros_like(dist)
+        
+        # 将归一化后的距离转换为相似度分数 (0到1之间)
+        similarity = torch.exp(-dist / self.temperature)
+        return similarity, dist
+        
+    def forward(self, edge_to, edge_from, embedding_to, embedding_from, is_temporal):
+        """
+        计算高维和低维空间中运动相似度的一致性损失
+        
+        Args:
+            edge_to: 高维空间中的目标节点特征
+            edge_from: 高维空间中的源节点特征
+            embedding_to: 低维空间中的目标节点嵌入
+            embedding_from: 低维空间中的源节点嵌入
+            is_temporal: 标识时序边的布尔张量
+        """
+        if not torch.any(is_temporal):
+            return torch.tensor(0.0, device=edge_from.device, requires_grad=True)
+            
+        # 只处理时序边
+        temporal_mask = is_temporal.bool()
+        edge_to = edge_to[temporal_mask]
+        edge_from = edge_from[temporal_mask]
+        embedding_to = embedding_to[temporal_mask]
+        embedding_from = embedding_from[temporal_mask]
+        
+        # 计算高维和低维空间中的相似度和归一化距离
+        high_dim_similarity, high_dim_dist = self.compute_normalized_similarity(edge_from, edge_to)
+        low_dim_similarity, low_dim_dist = self.compute_normalized_similarity(embedding_from, embedding_to)
+        
+        # 使用二元交叉熵损失
+        similarity_loss = F.binary_cross_entropy(low_dim_similarity, high_dim_similarity)
+        
+        # 添加距离相关性损失
+        # 使用MSE确保归一化后的距离模式相似
+        distance_loss = F.mse_loss(low_dim_dist, high_dim_dist)
+        
+        # 总损失是相似度损失和距离损失的加权和
+        total_loss = similarity_loss + distance_loss
+        
+        return total_loss
+
 class SingleVisLoss(nn.Module):
-    def __init__(self, umap_loss, recon_loss, temporal_loss=None, lambd=1.0, gamma=1.0):
+    def __init__(self, umap_loss, recon_loss, temporal_loss=None, velocity_loss=None, lambd=1.0, gamma=1.0, delta=1.0):
         super(SingleVisLoss, self).__init__()
         self.umap_loss = umap_loss
         self.recon_loss = recon_loss
         self.temporal_loss = temporal_loss
+        self.velocity_loss = velocity_loss  # 新添加的运动相似度损失
         self.lambd = lambd
         self.gamma = gamma
+        self.delta = delta  # 运动相似度损失的权重
 
     def forward(self, edge_to, edge_from, outputs, is_temporal):
         """
@@ -238,7 +312,6 @@ class SingleVisLoss(nn.Module):
         umap_loss = self.umap_loss(embedding_to, embedding_from)
         
         # Reconstruction loss (disabled)
-        # recon_loss = self.recon_loss(edge_to, edge_from, recon_to, recon_from)
         recon_loss = torch.tensor(0.0, device=edge_from.device)
         
         # Temporal ranking loss
@@ -251,11 +324,22 @@ class SingleVisLoss(nn.Module):
                 embedding_from,
                 is_temporal
             )
+            
+        # Velocity consistency loss
+        velocity_loss = 0.0
+        if self.velocity_loss is not None:
+            velocity_loss = self.velocity_loss(
+                edge_to,
+                edge_from,
+                embedding_to,
+                embedding_from,
+                is_temporal
+            )
         
-        # Remove recon_loss from total loss calculation
-        total_loss = umap_loss + self.gamma * temporal_loss
+        # Total loss
+        total_loss = umap_loss + self.gamma * temporal_loss + self.delta * velocity_loss
         
-        return umap_loss, recon_loss, temporal_loss, total_loss
+        return umap_loss, recon_loss, temporal_loss, velocity_loss, total_loss
 
 import torch.nn.functional as F
 
