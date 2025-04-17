@@ -18,19 +18,8 @@ import matplotlib.pyplot as plt
 import argparse
 from tqdm import tqdm
 
-# def parse_arguments():
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument("--select_idxs", nargs="+", type=int, default=1)
-
-#     args = parser.parse_args()
-
-#     return args
-
-# args = parse_arguments()
-
 # Parameters
-# content_path = "/home/zicong/data/Code_Retrieval_Samples/merged_train_data/"
-content_path = "/home/yiming/cophi/projects/fork/backdoor_attack/dynamic/BadNet_MNIST_noise_salt_pepper_s0_t0/Model"
+content_path = "./data/BadNet_MNIST_noise_salt_pepper_s0_t0/Model"
 epoch_start = 1
 epoch_end = 50
 epoch_period = 1
