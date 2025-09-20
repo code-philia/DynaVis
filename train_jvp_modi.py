@@ -11,6 +11,29 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
+# ===================== 全局加速设置 =====================
+torch.backends.cudnn.benchmark = True
+try:
+    torch.set_float32_matmul_precision('high')  # 允许 TF32
+except Exception:
+    pass
+
+def maybe_compile(m):
+    try:
+        return torch.compile(m)
+    except Exception:
+        return m
+
+def amp_capabilities():
+    # bfloat16优先；若不可用，退回fp16+GradScaler；都不行则禁用AMP
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    use_fp16 = torch.cuda.is_available()
+    return use_bf16, use_fp16
+
+USE_BF16, USE_FP16 = amp_capabilities()
+AMP_DTYPE = torch.bfloat16 if USE_BF16 else (torch.float16 if USE_FP16 else None)
+SCALER = None if (AMP_DTYPE is None or AMP_DTYPE == torch.bfloat16) else torch.cuda.amp.GradScaler()
+
 # ===================== 基础工具 =====================
 def seed_all(seed: int = 42):
     random.seed(seed); np.random.seed(seed)
@@ -29,16 +52,16 @@ class HParams:
     norm_mode: str = "robust"
     std_clip_low: float = 1e-8
     std_clip_high: float = 0.0
-    # 新增：三个对齐/排序副损的权重与开关
+    # 副损
     use_calib: bool = False
     use_sat: bool = False
     use_rank: bool = False
-    lambda_calib: float = 0.3   # 相对 push 的建议：先设 0.3×push
-    lambda_sat: float = 0.05    # 反饱和
-    lambda_rank: float = 0.2    # 排序一致
-    sat_margin: float = 0.95    # |c_lo| 超过此阈值才惩罚
-    rank_margin: float = 0.05   # pairwise hinge margin
-    rank_pairs: int = 256       # 每步采样多少对 pair 计算排序损失
+    lambda_calib: float = 0.3
+    lambda_sat: float = 0.05
+    lambda_rank: float = 0.2
+    sat_margin: float = 0.95
+    rank_margin: float = 0.05
+    rank_pairs: int = 256
 
 # ===================== 模型 & JVP =====================
 def time_embed(t: torch.Tensor, dim: int = 32) -> torch.Tensor:
@@ -56,6 +79,7 @@ def make_mlp(in_dim: int, out_dim: int, hidden: int = 256, depth: int = 3, act: 
     layers += [nn.Linear(d, out_dim)]
     return nn.Sequential(*layers)
 
+# 原逐样本JVP（保留作后备）
 def jvp_wrt_x_with_t(func_xt, x: torch.Tensor, v: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     from torch.autograd.functional import jvp
     outs=[]
@@ -64,6 +88,19 @@ def jvp_wrt_x_with_t(func_xt, x: torch.Tensor, v: torch.Tensor, t: torch.Tensor)
         _, j = jvp(lambda _x: func_xt(_x.unsqueeze(0), tb).squeeze(0), (xb,), (vb,), create_graph=True)
         outs.append(j)
     return torch.stack(outs, dim=0)
+
+# 更快的批量JVP（可用则优先）
+def jvp_wrt_x_with_t_fast(func_xt, x: torch.Tensor, v: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    try:
+        from torch.func import jvp as func_jvp
+    except Exception:
+        return jvp_wrt_x_with_t(func_xt, x, v, t)
+
+    def f_wrapped(x_):
+        return func_xt(x_, t)
+    # func_jvp 对整批做 JVP
+    _, jvp_out = func_jvp(f_wrapped, (x,), (v,))
+    return jvp_out
 
 class Encoder(nn.Module):
     def __init__(self, dim_x: int, dim_y: int, t_dim: int = 32, hidden: int = 256, depth: int = 3):
@@ -117,7 +154,7 @@ def compute_stats_for_norm(X_raw: np.ndarray, t_raw: np.ndarray,
     stats["t_max"] = np.array(float(np.max(t_raw)))
 
     if mode == "per_epoch":
-        mean_TD = X_raw.mean(axis=1)          # [T,D]
+        mean_TD = X_raw.mean(axis=1)
         std_TD  = _clip_std(X_raw.std(axis=1), std_clip_low, std_clip_high)
         stats["mean_per_epoch"] = mean_TD.astype(np.float32)
         stats["std_per_epoch"]  = std_TD.astype(np.float32)
@@ -135,7 +172,7 @@ def compute_stats_for_norm(X_raw: np.ndarray, t_raw: np.ndarray,
     elif mode == "center_only":
         mean = X_raw.mean(axis=(0,1))
         stats["mean"] = mean.astype(np.float32); stats["std"]  = np.ones_like(mean, dtype=np.float32)
-    else: # global
+    else:
         mean = X_raw.mean(axis=(0,1))
         std  = _clip_std(X_raw.std(axis=(0,1)), std_clip_low, std_clip_high)
         stats["mean"] = mean.astype(np.float32); stats["std"]  = std.astype(np.float32)
@@ -149,26 +186,19 @@ def apply_normalization_with_stats(X_raw: np.ndarray, Xdot_raw: np.ndarray, t_ra
     t = ((t_raw - t_min) / den).astype(np.float32)
 
     if mode == "per_epoch":
-        mean_TD = stats["mean_per_epoch"].astype(np.float32)  # [T,D]
-        std_TD  = stats["std_per_epoch"].astype(np.float32)   # [T,D]
+        mean_TD = stats["mean_per_epoch"].astype(np.float32)
+        std_TD  = stats["std_per_epoch"].astype(np.float32)
         X    = ((X_raw - mean_TD[:, None, :]) / std_TD[:, None, :]).astype(np.float32)
         Xdot = (Xdot_raw / std_TD[:, None, :]).astype(np.float32)
     else:
-        mean = stats["mean"].astype(np.float32)  # [D]
-        std  = stats["std"].astype(np.float32)   # [D]
+        mean = stats["mean"].astype(np.float32)
+        std  = stats["std"].astype(np.float32)
         X    = ((X_raw - mean) / std).astype(np.float32)
         Xdot = (Xdot_raw / std).astype(np.float32)
     return X, Xdot, t.astype(np.float32)
 
-# ===================== 数据集（原始：不含 neighbor） =====================
+# ===================== 数据集 =====================
 class PairDataset(Dataset):
-    """
-    返回:
-      - x_t: [D]
-      - x_dot: [D]
-      - t: scalar
-      - n: 该样本的轨迹编号（用于查参考向量）
-    """
     def __init__(self, X: np.ndarray, t: np.ndarray, Xdot: Optional[np.ndarray] = None):
         assert X.ndim == 3 and t.ndim == 1 and X.shape[0] == t.shape[0]
         self.X = X.astype(np.float32); self.t = t.astype(np.float32)
@@ -184,22 +214,21 @@ class PairDataset(Dataset):
                 't': torch.tensor(self.t[k], dtype=torch.float32),
                 'n': torch.tensor(n, dtype=torch.long)}
 
-# ===================== 三项新损需要的端点缓存 =====================
+# ===================== 端点缓存 =====================
 @dataclass
 class EndpointCache:
-    X0: torch.Tensor  # [N, D]  标准化后的起点
-    XT: torch.Tensor  # [N, D]  标准化后的终点
+    X0: torch.Tensor  # [N, D]
+    XT: torch.Tensor  # [N, D]
     t0: float
     tT: float
 
 def build_endpoint_cache(X: np.ndarray, t: np.ndarray, device: str) -> EndpointCache:
-    # 注意：X, t 已经是标准化后的
-    X0 = torch.from_numpy(X[0]).to(device)      # [N, D]
-    XT = torch.from_numpy(X[-1]).to(device)     # [N, D]
+    X0 = torch.from_numpy(X[0]).to(device)
+    XT = torch.from_numpy(X[-1]).to(device)
     t0 = float(t[0]); tT = float(t[-1])
     return EndpointCache(X0=X0, XT=XT, t0=t0, tT=tT)
 
-# ===================== 新增：三项副损（在 joint_losses 内调用） =====================
+# ===================== 副损与工具 =====================
 def cosine(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     a_n = F.normalize(a, dim=-1, eps=eps)
     b_n = F.normalize(b, dim=-1, eps=eps)
@@ -210,60 +239,32 @@ def pairwise_rank_loss(
     c_hi: torch.Tensor,
     num_pairs: int = 256,
     margin: float = 0.05,
-    min_gap: float = 0.02,       # ★ 新增：高维分数至少相差这么多才算有效约束
-    hard_ratio: float = 0.5,     # ★ 新增：一半从“最容易分”的top-bottom挑，另一半随机采样过滤
+    min_gap: float = 0.02,
+    hard_ratio: float = 0.5,
 ) -> torch.Tensor:
-    """
-    更稳的 Spearman 代理：
-    - 一半 pairs 用“极端对”（高维分数最高 vs 最低）保证 sign != 0；
-    - 另一半随机 pairs，但过滤掉 |c_hi_i - c_hi_j| <= min_gap 的“无效对”；
-    - 用 pairwise hinge: [margin - sign(c_hi_i - c_hi_j) * (c_lo_i - c_lo_j)]_+ 。
-    """
     device = c_lo.device
     B = c_lo.numel()
     if B < 2:
         return torch.zeros((), device=device)
-
-    # 保底 clamp，避免数值偶发 >1
     c_lo = c_lo.clamp(-1.0, 1.0)
     c_hi = c_hi.clamp(-1.0, 1.0)
-
-    # ---- 1) “极端对”：top vs bottom，确保有有效对 ----
-    k_hard = int(num_pairs * hard_ratio)
-    k_rand = num_pairs - k_hard
-
-    # 排序索引（按高维评分）
-    order = torch.argsort(c_hi, dim=0)     # 升序
-    # 两端各取 m 个
-    m = max(1, min(B // 4, k_hard))        # 取四分之一或不超过需求
-    bottom_idx = order[:m]
-    top_idx    = order[-m:]
-
-    # 和尚配对（长度一致）
+    k_hard = int(num_pairs * hard_ratio); k_rand = num_pairs - k_hard
+    order = torch.argsort(c_hi, dim=0)
+    m = max(1, min(B // 4, k_hard))
+    bottom_idx = order[:m]; top_idx = order[-m:]
     if top_idx.numel() != bottom_idx.numel():
         m = min(top_idx.numel(), bottom_idx.numel())
-        top_idx = top_idx[-m:]
-        bottom_idx = bottom_idx[:m]
-
-    p_hard = top_idx
-    q_hard = bottom_idx
-
-    # ---- 2) 随机对 + 过滤小差值 ----
-    # 随机采到 2*k_rand 个，然后过滤掉 |diff|<=min_gap，再截断到 k_rand
+        top_idx = top_idx[-m:]; bottom_idx = bottom_idx[:m]
+    p_hard = top_idx; q_hard = bottom_idx
     if k_rand > 0:
-        # 至少采足量候选
         cand = max(2 * k_rand, 1)
         idx = torch.randint(0, B, (2 * cand,), device=device)
-        p_all = idx[:cand]
-        q_all = idx[cand:]
-
+        p_all = idx[:cand]; q_all = idx[cand:]
         diff = (c_hi[p_all] - c_hi[q_all])
         mask = diff.abs() > min_gap
         if mask.any():
-            p_rand = p_all[mask][:k_rand]
-            q_rand = q_all[mask][:k_rand]
+            p_rand = p_all[mask][:k_rand]; q_rand = q_all[mask][:k_rand]
         else:
-            # 兜底：如果全都太接近，就退化成再拿一些极端对或直接用 top/bottom 循环
             need = k_rand
             rep_top = top_idx.repeat((need + m - 1) // m)[:need]
             rep_bot = bottom_idx.repeat((need + m - 1) // m)[:need]
@@ -271,22 +272,11 @@ def pairwise_rank_loss(
     else:
         p_rand = torch.empty(0, dtype=torch.long, device=device)
         q_rand = torch.empty(0, dtype=torch.long, device=device)
-
-    # ---- 3) 拼接所有 pairs ----
-    p = torch.cat([p_hard, p_rand], dim=0)
-    q = torch.cat([q_hard, q_rand], dim=0)
-    if p.numel() == 0:
-        return torch.zeros((), device=device)
-
-    # ---- 4) 计算 hinge 排序损失 ----
-    # 高维的排序方向
-    s = c_hi[p] - c_hi[q]
-    sign = torch.sign(s)  # {-1, 0, 1}
-    # 过滤相等（或近似相等）的对（极少数情况）
+    p = torch.cat([p_hard, p_rand], dim=0); q = torch.cat([q_hard, q_rand], dim=0)
+    if p.numel() == 0: return torch.zeros((), device=device)
+    s = c_hi[p] - c_hi[q]; sign = torch.sign(s)
     mask = (sign != 0).float()
-    # 低维的差
     d_lo = c_lo[p] - c_lo[q]
-    # hinge:  希望 sign * d_lo >= margin
     loss_vec = F.relu(margin - sign * d_lo) * mask
     denom = mask.sum().clamp_min(1.0)
     return loss_vec.sum() / denom
@@ -295,7 +285,6 @@ def pairwise_rank_loss(
 def joint_losses(
     f: Encoder, g: Decoder | None, W: LowDimVF, batch,
     lambda_push=1.0, lambda_pull=1.0, lambda_rec=1.0, lip_reg=0.0,
-    # 新增：端点缓存 & 三项副损的超参
     ep_cache: Optional[EndpointCache] = None,
     use_calib: bool = False, lambda_calib: float = 0.3,
     use_sat: bool = False, lambda_sat: float = 0.05, sat_margin: float = 0.95,
@@ -303,60 +292,58 @@ def joint_losses(
     **_
 ):
     x_t = batch['x_t']; t = batch['t']; Vx = batch['x_dot']; n_idx = batch['n'].long()
-    # 主干：push / pull / rec / lip
-    y = f(x_t, t)                         # [B, d]
-    JfV = jvp_wrt_x_with_t(f, x_t, Vx, t) # [B, d]  目标低维速度
-    Wy  = W(y, t)                         # [B, d]  预测低维速度
-    L_push = F.mse_loss(JfV, Wy)
 
-    L_pull = torch.tensor(0.0, device=x_t.device); L_rec = torch.tensor(0.0, device=x_t.device)
-    if exists(g):
-        JgW = jvp_wrt_x_with_t(g, y,  Wy, t)
-        L_pull = F.mse_loss(Vx, JgW)
-        L_rec  = F.mse_loss(g(y, t), x_t)
+    # AMP 区域下做前向与JVP
+    if AMP_DTYPE is None:
+        y = f(x_t, t)
+        JfV = jvp_wrt_x_with_t_fast(f, x_t, Vx, t)
+        Wy  = W(y, t)
+        L_push = F.mse_loss(JfV, Wy)
+        L_pull = torch.tensor(0.0, device=x_t.device); L_rec = torch.tensor(0.0, device=x_t.device)
+        if exists(g):
+            JgW = jvp_wrt_x_with_t_fast(g, y,  Wy, t)
+            L_pull = F.mse_loss(Vx, JgW)
+            L_rec  = F.mse_loss(g(y, t), x_t)
+    else:
+        with torch.cuda.amp.autocast(dtype=AMP_DTYPE):
+            y = f(x_t, t)
+            JfV = jvp_wrt_x_with_t_fast(f, x_t, Vx, t)
+            Wy  = W(y, t)
+            L_push = F.mse_loss(JfV, Wy)
+            L_pull = torch.tensor(0.0, device=x_t.device); L_rec = torch.tensor(0.0, device=x_t.device)
+            if exists(g):
+                JgW = jvp_wrt_x_with_t_fast(g, y,  Wy, t)
+                L_pull = F.mse_loss(Vx, JgW)
+                L_rec  = F.mse_loss(g(y, t), x_t)
 
     L_lip = torch.tensor(0.0, device=x_t.device)
     if lip_reg > 0:
-        u  = torch.randn_like(x_t); Ju = jvp_wrt_x_with_t(f, x_t, u, t)
+        u  = torch.randn_like(x_t)
+        Ju = jvp_wrt_x_with_t_fast(f, x_t, u, t)
         L_lip = (Ju.norm(dim=-1) / (u.norm(dim=-1) + 1e-8)).mean()
 
-    # ===== 三项副损（可选）=====
     L_calib = torch.tensor(0.0, device=x_t.device)
     L_sat   = torch.tensor(0.0, device=x_t.device)
     L_rank  = torch.tensor(0.0, device=x_t.device)
 
     if (use_calib or use_sat or use_rank) and (ep_cache is not None):
-        # 端点连线（高维 & 低维）
-        X0_n = ep_cache.X0[n_idx]     # [B, D]
-        XT_n = ep_cache.XT[n_idx]     # [B, D]
+        X0_n = ep_cache.X0[n_idx]
+        XT_n = ep_cache.XT[n_idx]
         t0   = torch.full((x_t.size(0),), ep_cache.t0, device=x_t.device, dtype=t.dtype)
         tT   = torch.full((x_t.size(0),), ep_cache.tT, device=x_t.device, dtype=t.dtype)
-
-        # 高维参考方向（起终点连线）
-        e_hi = (XT_n - X0_n)          # [B, D]
-        # 低维参考方向：用当前 f 编码端点
-        with torch.no_grad():  # 参考向量不回传梯度，避免额外开销（也可去掉 no_grad）
-            y0 = f(X0_n, t0)          # [B, d]
-            yT = f(XT_n, tT)          # [B, d]
-            e_lo = (yT - y0)          # [B, d]
-
-        # 构造高/低维余弦分数
-        c_hi = cosine(Vx, e_hi)       # 高维：速度 vs 端点连线
-        c_lo = cosine(Wy, e_lo)       # 低维：预测速度 vs 端点连线（低维端点由 f 现算）
-
+        with torch.no_grad():
+            y0 = f(X0_n, t0); yT = f(XT_n, tT)
+            e_lo = (yT - y0)
+        e_hi = (XT_n - X0_n)
+        c_hi = cosine(Vx, e_hi)
+        c_lo = cosine(Wy, e_lo)
         if use_calib:
-            # 方向回归校准（Huber 更稳）
             L_calib = F.smooth_l1_loss(c_lo, c_hi)
-
         if use_sat:
-            # 反饱和（只对 |c_lo|>sat_margin 惩罚，避免到 ±1 附近堆积）
             L_sat = F.relu(c_lo.abs() - sat_margin).pow(2).mean()
-
         if use_rank:
-            # 排序一致（pairwise hinge Spearman 代理）
             L_rank = pairwise_rank_loss(c_lo, c_hi, num_pairs=rank_pairs, margin=rank_margin)
 
-    # 总损
     loss = (lambda_push*L_push + lambda_pull*L_pull + lambda_rec*L_rec + lip_reg*L_lip
             + (lambda_calib * L_calib if use_calib else 0.0)
             + (lambda_sat   * L_sat   if use_sat   else 0.0)
@@ -373,104 +360,168 @@ def lipschitz_penalty(f, x, t, subset: int | None = 512):
     if subset is not None and x.size(0) > subset:
         idx = torch.randperm(x.size(0), device=x.device)[:subset]
         x = x[idx]; t = t[idx]
-    u  = torch.randn_like(x); Ju = jvp_wrt_x_with_t(f, x, u, t)
+    u  = torch.randn_like(x); Ju = jvp_wrt_x_with_t_fast(f, x, u, t)
     return (Ju.norm(dim=-1) / (u.norm(dim=-1) + 1e-8)).mean()
+
+# ===================== 三阶段（优化版） =====================
+def _adamw_fused_supported():
+    try:
+        return torch.cuda.is_available()
+    except Exception:
+        return False
 
 def stage1_pretrain_ae(f, g, dl, device, epochs=8, lr_f=5e-4, lr_g=1e-3,
                        lip_max=1e-3, lip_warmup=3, lip_every=2, lip_subset=256):
+    f = maybe_compile(f); g = maybe_compile(g)
     opt = torch.optim.AdamW([
         {'params': f.parameters(), 'lr': lr_f},
         {'params': g.parameters(), 'lr': lr_g},
-    ], weight_decay=0.0)
+    ], weight_decay=0.0, fused=_adamw_fused_supported())
     f.train(); g.train()
     for epoch in range(1, epochs+1):
         lam_lip = lip_max * min(1.0, epoch / max(1, lip_warmup))
         acc = {'rec':0.0, 'lip':0.0, 'n':0}
-        for step, batch in enumerate(tqdm(dl, desc=f'[AE] epoch {epoch}/{epochs}')):
-            for k in batch: batch[k] = batch[k].to(device)
+        pbar = tqdm(dl, desc=f'[AE] epoch {epoch}/{epochs}')
+        for step, batch in enumerate(pbar):
+            for k in batch: batch[k] = batch[k].to(device, non_blocking=True)
             x_t, t = batch['x_t'], batch['t']
-            y = f(x_t, t); L_rec = F.mse_loss(g(y, t), x_t)
-            if lam_lip > 0 and (step % lip_every == 0):
-                L_lip = lipschitz_penalty(f, x_t, t, subset=lip_subset)
-            else: L_lip = torch.tensor(0.0, device=device)
-            lam_lip = 0
-            loss = L_rec + lam_lip * L_lip
-            opt.zero_grad(); loss.backward(); opt.step()
+            if AMP_DTYPE is None:
+                y = f(x_t, t); L_rec = F.mse_loss(g(y, t), x_t)
+                if lam_lip > 0 and (step % lip_every == 0):
+                    L_lip = lipschitz_penalty(f, x_t, t, subset=lip_subset)
+                else: L_lip = torch.tensor(0.0, device=device)
+                lam_lip_effective = 0.0  # 你原先就置0，这里保持一致
+                loss = L_rec + lam_lip_effective * L_lip
+                opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+            else:
+                with torch.cuda.amp.autocast(dtype=AMP_DTYPE):
+                    y = f(x_t, t); L_rec = F.mse_loss(g(y, t), x_t)
+                    if lam_lip > 0 and (step % lip_every == 0):
+                        L_lip = lipschitz_penalty(f, x_t, t, subset=lip_subset)
+                    else: L_lip = torch.tensor(0.0, device=device)
+                    lam_lip_effective = 0.0
+                    loss = L_rec + lam_lip_effective * L_lip
+                opt.zero_grad(set_to_none=True)
+                if SCALER is None: loss.backward(); opt.step()
+                else: SCALER.scale(loss).backward(); SCALER.step(opt); SCALER.update()
+
             acc['rec'] += L_rec.item(); acc['lip'] += L_lip.item(); acc['n'] += 1
-        print(f"[AE] epoch {epoch}/{epochs}  L_rec={acc['rec']/acc['n']:.5f}  L_lip={acc['lip']/max(1,acc['n']):.5f}  λ_lip={lam_lip:g}")
+            pbar.set_postfix(rec=acc['rec']/acc['n'])
+        print(f"[AE] epoch {epoch}/{epochs}  L_rec={acc['rec']/acc['n']:.5f}  L_lip={acc['lip']/max(1,acc['n']):.5f}  λ_lip={lam_lip_effective:g}")
 
 def stage2_train_W(f, g, W, dl, device, epochs=4, lr_W=2e-3):
     for p in f.parameters(): p.requires_grad = False
     for p in g.parameters(): p.requires_grad = False
-    W.train()
-    opt = torch.optim.AdamW(W.parameters(), lr=lr_W, weight_decay=0.0)
+    for p in W.parameters(): p.requires_grad = True
+    f = maybe_compile(f); W = maybe_compile(W)
+    opt = torch.optim.AdamW(W.parameters(), lr=lr_W, weight_decay=0.0, fused=_adamw_fused_supported())
+
     for epoch in range(1, epochs+1):
-        acc = {'push':0.0, 'n':0}
-        for batch in tqdm(dl, desc=f'[W] epoch {epoch}/{epochs}'):
-            for k in batch: batch[k] = batch[k].to(device)
+        W.train()
+        acc_push, nstep = 0.0, 0
+        pbar = tqdm(dl, desc=f'[W] epoch {epoch}/{epochs}')
+        for batch in pbar:
+            for k in batch: batch[k] = batch[k].to(device, non_blocking=True)
             x_t, t, Vx = batch['x_t'], batch['t'], batch['x_dot']
-            y = f(x_t, t)
-            target_y_dot = jvp_wrt_x_with_t(f, x_t, Vx, t)
-            pred_y_dot   = W(y, t)
-            L_push = F.mse_loss(pred_y_dot, target_y_dot)
-            opt.zero_grad(); L_push.backward(); opt.step()
-            acc['push'] += L_push.item(); acc['n'] += 1
-        print(f"[W] epoch {epoch}/{epochs}  L_push={acc['push']/acc['n']:.5f}")
+
+            if AMP_DTYPE is None:
+                y = f(x_t, t)
+                target_y_dot = jvp_wrt_x_with_t_fast(f, x_t, Vx, t)
+                pred_y_dot   = W(y, t)
+                L_push = F.mse_loss(pred_y_dot, target_y_dot)
+                opt.zero_grad(set_to_none=True); L_push.backward(); opt.step()
+            else:
+                with torch.cuda.amp.autocast(dtype=AMP_DTYPE):
+                    y = f(x_t, t)
+                    target_y_dot = jvp_wrt_x_with_t_fast(f, x_t, Vx, t)
+                    pred_y_dot   = W(y, t)
+                    L_push = F.mse_loss(pred_y_dot, target_y_dot)
+                opt.zero_grad(set_to_none=True)
+                if SCALER is None: L_push.backward(); opt.step()
+                else: SCALER.scale(L_push).backward(); SCALER.step(opt); SCALER.update()
+
+            acc_push += L_push.item(); nstep += 1
+            pbar.set_postfix(push=acc_push/nstep)
+        print(f"[W] epoch {epoch}/{epochs}  L_push={acc_push/nstep:.5f}")
 
 def stage3_joint_finetune(
     f, g, W, dl, device, ep_cache: EndpointCache,
     epochs=18, base_lrs=(2e-4, 5e-4, 1e-3),
     lambdas=(1.0, 1.0, 1.0),
     warmup=6, lip_max=1e-3, lip_warmup=6,
-    # 副损的开关/权重
     use_calib=False, use_sat=False, use_rank=False,
     lambda_calib=0.3, lambda_sat=0.05, lambda_rank=0.2,
-    sat_margin=0.95, rank_pairs=256, rank_margin=0.05
+    sat_margin=0.95, rank_pairs=256, rank_margin=0.05,
+    grad_accum_steps=1
 ):
     lr_f, lr_g, lr_W = base_lrs
     lam_push_t, lam_pull_t, lam_rec = lambdas
     for p in f.parameters(): p.requires_grad = True
     for p in g.parameters(): p.requires_grad = True
     for p in W.parameters(): p.requires_grad = True
+
+    f = maybe_compile(f); g = maybe_compile(g); W = maybe_compile(W)
     opt = torch.optim.AdamW([
         {'params': f.parameters(), 'lr': lr_f},
         {'params': g.parameters(), 'lr': lr_g},
         {'params': W.parameters(), 'lr': lr_W},
-    ], weight_decay=0.0)
+    ], weight_decay=0.0, fused=_adamw_fused_supported())
 
     for epoch in range(1, epochs+1):
         scale = min(1.0, epoch / max(1, warmup))
         lam_push = lam_push_t * scale
         lam_pull = lam_pull_t * scale
-        lam_lip  = lip_max * min(1.0, epoch / max(1, lip_warmup))
-        lam_lip = 0
+        lam_lip  = 0.0  # 你原代码已置0，保持一致
+
         f.train(); g.train(); W.train()
-        acc = {'push':0.0, 'pull':0.0, 'rec':0.0, 'lip':0.0, 'calib':0.0, 'sat':0.0, 'rank':0.0, 'n':0}
-        for batch in tqdm(dl, desc=f'[Joint] epoch {epoch}/{epochs}'):
-            for k in batch: batch[k] = batch[k].to(device)
-            outs = joint_losses(
-                f, g, W, batch,
-                lambda_push=lam_push, lambda_pull=lam_pull, lambda_rec=lam_rec, lip_reg=lam_lip,
-                ep_cache=ep_cache,
-                use_calib=use_calib, lambda_calib=lambda_calib,
-                use_sat=use_sat, lambda_sat=lambda_sat, sat_margin=sat_margin,
-                use_rank=use_rank, lambda_rank=lambda_rank, rank_pairs=rank_pairs, rank_margin=rank_margin,
-                current_epoch=epoch
-            )
-            loss = outs['loss']
-            opt.zero_grad(); loss.backward(); opt.step()
-            acc['push'] += outs['L_push'].item()
-            acc['pull'] += outs['L_pull'].item()
-            acc['rec']  += outs['L_rec'].item()
-            acc['lip']  += outs['L_lip'].item()
-            acc['calib']+= outs['L_calib'].item()
-            acc['sat']  += outs['L_sat'].item()
-            acc['rank'] += outs['L_rank'].item()
-            acc['n']    += 1
-        print(f"[Joint] epoch {epoch}/{epochs} | λpush={lam_push:g} λpull={lam_pull:g} λrec={lam_rec:g} λlip={lam_lip:g} "
-              f"| L_push={acc['push']/acc['n']:.5f} L_pull={acc['pull']/acc['n']:.5f} "
-              f"L_rec={acc['rec']/acc['n']:.5f} L_lip={acc['lip']/acc['n']:.5f} "
-              f"L_calib={acc['calib']/acc['n']:.5f} L_sat={acc['sat']/acc['n']:.5f} L_rank={acc['rank']/acc['n']:.5f}")
+        meters = {k:0.0 for k in ['push','pull','rec','lip','calib','sat','rank']}
+        nstep = 0
+
+        pbar = tqdm(dl, desc=f'[Joint] epoch {epoch}/{epochs}')
+        opt.zero_grad(set_to_none=True)
+        for step, batch in enumerate(pbar, start=1):
+            for k in batch: batch[k] = batch[k].to(device, non_blocking=True)
+
+            if AMP_DTYPE is None:
+                outs = joint_losses(
+                    f, g, W, batch,
+                    lambda_push=lam_push, lambda_pull=lam_pull, lambda_rec=lam_rec, lip_reg=lam_lip,
+                    ep_cache=ep_cache,
+                    use_calib=use_calib, lambda_calib=lambda_calib,
+                    use_sat=use_sat, lambda_sat=lambda_sat, sat_margin=sat_margin,
+                    use_rank=use_rank, lambda_rank=lambda_rank, rank_pairs=rank_pairs, rank_margin=rank_margin,
+                    current_epoch=epoch
+                )
+                loss = outs['loss'] / grad_accum_steps
+                loss.backward()
+            else:
+                with torch.cuda.amp.autocast(dtype=AMP_DTYPE):
+                    outs = joint_losses(
+                        f, g, W, batch,
+                        lambda_push=lam_push, lambda_pull=lam_pull, lambda_rec=lam_rec, lip_reg=lam_lip,
+                        ep_cache=ep_cache,
+                        use_calib=use_calib, lambda_calib=lambda_calib,
+                        use_sat=use_sat, lambda_sat=lambda_sat, sat_margin=sat_margin,
+                        use_rank=use_rank, lambda_rank=lambda_rank, rank_pairs=rank_pairs, rank_margin=rank_margin,
+                        current_epoch=epoch
+                    )
+                    loss = outs['loss'] / grad_accum_steps
+                if SCALER is None: loss.backward()
+                else: SCALER.scale(loss).backward()
+
+            if step % grad_accum_steps == 0:
+                if SCALER is None:
+                    opt.step()
+                else:
+                    SCALER.step(opt); SCALER.update()
+                opt.zero_grad(set_to_none=True)
+
+            for k in meters: meters[k] += outs[f"L_{k}"].item()
+            nstep += 1
+            pbar.set_postfix({k: meters[k]/nstep for k in meters})
+
+        print(f"[Joint] epoch {epoch}/{epochs} | λpush={lam_push:g} λpull={lam_pull:g} λrec={lam_rec:g} "
+              + " ".join([f"L_{k}={meters[k]/nstep:.5f}" for k in meters]))
 
 # ===================== 推理导出（原样） =====================
 @torch.no_grad()
@@ -506,7 +557,11 @@ def save_predicted_Y_raw(
         tk = torch.full((N,), float(t[k]), device=device)
         for s in range(0, N, batch_size):
             xe = xk[s:s+batch_size]; te = tk[s:s+batch_size]
-            Y[k, s:s+batch_size] = f(xe, te).cpu().numpy().astype(np.float32)
+            if AMP_DTYPE is None:
+                Y[k, s:s+batch_size] = f(xe, te).cpu().numpy().astype(np.float32)
+            else:
+                with torch.cuda.amp.autocast(dtype=AMP_DTYPE):
+                    Y[k, s:s+batch_size] = f(xe, te).float().cpu().numpy().astype(np.float32)
         if per_epoch_dir:
             os.makedirs(per_epoch_dir, exist_ok=True)
             np.save(os.path.join(per_epoch_dir, f"epoch_{k+1}_embedding.npy"), Y[k])
@@ -528,7 +583,11 @@ def visualize(f: Encoder, W: LowDimVF, X: np.ndarray, t: np.ndarray, out='viz_lo
         for k in range(T):
             xk = torch.from_numpy(X[k]).to(device)
             tk = torch.full((N,), float(t[k]), device=device)
-            Y[k] = f(xk, tk).cpu().numpy()
+            if AMP_DTYPE is None:
+                Y[k] = f(xk, tk).cpu().numpy()
+            else:
+                with torch.cuda.amp.autocast(dtype=AMP_DTYPE):
+                    Y[k] = f(xk, tk).float().cpu().numpy()
     if Y.shape[-1] == 2:
         import matplotlib.pyplot as plt
         plt.figure(figsize=(6,6))
@@ -545,11 +604,10 @@ def visualize(f: Encoder, W: LowDimVF, X: np.ndarray, t: np.ndarray, out='viz_lo
 # ===================== 主流程 =====================
 def train(args: HParams):
     seed_all(0)
-    data_path = "/inspire/hdd/global_user/liuyiming-240108540153/training_dynamic/image_models/ResNet-TinyImageNet/Classification-normal/selected_subset/stacked_train_embeddings.npy"
+    data_path = "/inspire/hdd/global_user/liuyiming-240108540153/training_dynamic/text_models/TextRCNN-THUCNews/Classification/selected_subset/stacked_train_embeddings.npy"
     X_raw, t_raw, Xdot_raw = load_or_generate(path=data_path)
 
-    # 计算并应用规范化（默认 robust）
-    ckpt_dir = "/inspire/hdd/global_user/liuyiming-240108540153/training_dynamic/image_models/ResNet-TinyImageNet/Classification-normal/selected_subset/checkpoints"
+    ckpt_dir = "/inspire/hdd/global_user/liuyiming-240108540153/training_dynamic/text_models/TextRCNN-THUCNews/Classification/selected_subset/checkpoints"
     os.makedirs(ckpt_dir, exist_ok=True)
     stats = compute_stats_for_norm(X_raw, t_raw, mode=args.norm_mode,
                                    std_clip_low=args.std_clip_low, std_clip_high=args.std_clip_high)
@@ -557,19 +615,24 @@ def train(args: HParams):
     np.savez(stats_path, **stats)
     X, Xdot, t = apply_normalization_with_stats(X_raw, Xdot_raw, t_raw, stats)
 
-    # DataLoader：原始 PairDataset（不使用 neighbor）
+    # DataLoader（更快的参数）
+    num_workers = max(2, os.cpu_count() // 2) if torch.cuda.is_available() else 0
     ds = PairDataset(X, t, Xdot)
-    dl = DataLoader(ds, batch_size=args.bs, shuffle=True, drop_last=False, num_workers=0, pin_memory=True)
+    dl = DataLoader(
+        ds, batch_size=args.bs, shuffle=True, drop_last=False,
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=(num_workers > 0), prefetch_factor=(4 if num_workers > 0 else None)
+    )
 
     # 模型
     f = Encoder(args.D, args.d).to(args.device)
     g = Decoder(args.d, args.D).to(args.device)
     W = LowDimVF(args.d).to(args.device)
 
-    # 端点缓存（标准化后）
+    # 端点缓存
     ep_cache = build_endpoint_cache(X, t, device=args.device)
 
-    # 三阶段训练
+    # 三阶段训练（与原逻辑一致）
     stage1_pretrain_ae(f, g, dl, args.device,
                        epochs=8, lr_f=5e-4, lr_g=1e-3,
                        lip_max=1e-3, lip_warmup=3, lip_every=2, lip_subset=256)
@@ -599,7 +662,7 @@ def train(args: HParams):
 # ===================== CLI =====================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--D', type=int, default=512)
+    parser.add_argument('--D', type=int, default=812)
     parser.add_argument('--d', type=int, default=2)
     parser.add_argument('--T', type=int, default=50)
     parser.add_argument('--N', type=int, default=500)
@@ -609,12 +672,10 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_pull', type=float, default=1.0)
     parser.add_argument('--lambda_rec', type=float, default=1.0)
     parser.add_argument('--lip_reg', type=float, default=1e-3)
-    # 规范化
     parser.add_argument('--norm_mode', type=str, default='robust',
                         choices=['global','anchor0','robust','per_epoch','center_only'])
     parser.add_argument('--std_clip_low', type=float, default=1e-8)
     parser.add_argument('--std_clip_high', type=float, default=0.0)
-    # 三项副损开关/权重
     parser.add_argument('--use_calib', action='store_true')
     parser.add_argument('--use_sat', action='store_true')
     parser.add_argument('--use_rank', action='store_true')
@@ -636,3 +697,6 @@ if __name__ == '__main__':
                 lambda_calib=args.lambda_calib, lambda_sat=args.lambda_sat, lambda_rank=args.lambda_rank,
                 sat_margin=args.sat_margin, rank_pairs=args.rank_pairs, rank_margin=args.rank_margin)
     train(h)
+
+
+# python train_jvp_modi.py --norm_mode robust --use_calib --use_sat --use_rank
